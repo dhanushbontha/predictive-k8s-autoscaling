@@ -1,0 +1,8 @@
+# Runtime dependencies (pinned) — see docs/versions.md
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+prometheus-client==0.26.0
+starlette==1.7.0
+
+# Test dependencies (not installed in the container image)
+# Install with: pip install -r requirements-dev.txt

@@ -1,0 +1,64 @@
+# k8s/deployment.yaml
+# Workload app Deployment — NO autoscaler yet (added per-policy in later chunks).
+# Resource requests/limits are shared across ALL autoscaling policies so comparisons are fair.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workload-app
+  namespace: workload
+  labels:
+    app: workload-app
+spec:
+  # replica count is managed by the autoscaler in later chunks;
+  # baseline = 1 replica with no HPA/KEDA attached yet
+  replicas: 1
+  selector:
+    matchLabels:
+      app: workload-app
+  template:
+    metadata:
+      labels:
+        app: workload-app
+      annotations:
+        # Tell Prometheus to scrape this pod directly (fallback if ServiceMonitor not picked up)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: workload-app
+          # Image built locally and loaded into Minikube (see docs/build.md)
+          image: workload-app:latest
+          # Never pull from a registry — image was loaded with `minikube image load`
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: WORK_MS
+              value: "20"                  # ms of CPU burn per /work request
+            - name: STARTUP_DELAY_SECONDS
+              value: "5"                   # seconds before /ready returns 200
+          # ── resource constraints (identical across ALL autoscaling policies) ──
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          # ── probes ────────────────────────────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6           # allow up to 30 s (6 × 5 s) to become ready

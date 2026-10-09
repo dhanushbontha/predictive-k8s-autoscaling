@@ -1,0 +1,30 @@
+# k8s/service-monitor.yaml
+# Prometheus Operator ServiceMonitor — tells kube-prometheus-stack to scrape
+# the workload-app Service's /metrics endpoint every 15 seconds.
+#
+# Prerequisites:
+#   The 'monitoring' release of kube-prometheus-stack must have
+#   --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false
+#   --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+#   OR the ServiceMonitor must carry the release label below.
+#   The setup script (scripts/setup-cluster.ps1) already sets these flags.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: workload-app
+  namespace: monitoring          # must live in the same namespace as Prometheus
+  labels:
+    # This label is required by the default kube-prometheus-stack selector
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - workload
+  selector:
+    matchLabels:
+      app: workload-app
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

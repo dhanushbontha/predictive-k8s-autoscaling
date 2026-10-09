@@ -13,6 +13,25 @@ a component is intentionally upgraded, and update the corresponding scripts too.
 | KEDA (Helm chart) | 2.21.0 | kedacore/keda; latest stable (Sep 2026) |
 | kube-prometheus-stack (Helm chart) | 92.1.1 | prometheus-community/kube-prometheus-stack; latest stable (Oct 2026) |
 
+## Python App Dependencies (app/)
+
+| Package | Version | Notes |
+|---|---|---|
+| Python base image | `python:3.12-slim` | Docker Hub official; Debian-based slim variant |
+| fastapi | 0.142.2 | Latest stable (Sep 2026) |
+| uvicorn[standard] | 0.54.0 | Latest stable (Oct 2026) |
+| starlette | 1.7.0 | Latest stable (Sep 2026); transitive FastAPI dep, pinned |
+| prometheus-client | 0.26.0 | Latest stable (Jul 2026) |
+
+## Test / Dev Dependencies (app/requirements-dev.txt)
+
+| Package | Version | Notes |
+|---|---|---|
+| pytest | 9.1.1 | Latest stable (Oct 2026) |
+| pytest-asyncio | 1.4.0 | Latest stable (Oct 2026) |
+| httpx | 0.28.1 | Latest stable; used for ASGI test client |
+| anyio | 4.9.0 | async runtime for tests |
+
 ## Helm Repositories
 
 | Alias | URL |
@@ -26,6 +45,7 @@ a component is intentionally upgraded, and update the corresponding scripts too.
 |---|---|
 | KEDA | `keda` |
 | Prometheus / Grafana | `monitoring` |
+| Workload app | `workload` |
 
 ## Notes
 

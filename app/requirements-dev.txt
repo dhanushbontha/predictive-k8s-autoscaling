@@ -1,0 +1,6 @@
+# Dev/test dependencies — NOT installed in the container image
+# Install with: pip install -r requirements-dev.txt
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1
+anyio==4.9.0

@@ -170,6 +170,8 @@ if ($promInstalled -eq "prometheus") {
             --set grafana.adminPassword=admin `
             --set prometheus.prometheusSpec.scrapeInterval=15s `
             --set prometheus.prometheusSpec.evaluationInterval=15s `
+            --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false `
+            --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false `
             --wait `
             --timeout 10m
     }
@@ -181,6 +183,8 @@ if ($promInstalled -eq "prometheus") {
             --set grafana.adminPassword=admin `
             --set prometheus.prometheusSpec.scrapeInterval=15s `
             --set prometheus.prometheusSpec.evaluationInterval=15s `
+            --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false `
+            --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false `
             --wait `
             --timeout 10m
     }

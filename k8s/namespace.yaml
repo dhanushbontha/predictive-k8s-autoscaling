@@ -1,0 +1,9 @@
+# k8s/namespace.yaml
+# Creates a dedicated namespace for all workload-app resources.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workload
+  labels:
+    # Allow Prometheus (in 'monitoring' ns) to scrape this namespace
+    monitoring: "true"
