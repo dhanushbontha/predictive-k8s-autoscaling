@@ -5,109 +5,149 @@ This plan governs the engineering, experimentation, and paper production for the
 
 ---
 
-## 1. Pinned-Version Candidates
+## 1. Machine and Time Estimate
 
-All versions are empirically verified from current official registries as of October 2026:
+### Host Machine Profile
+* **Operating System:** Microsoft Windows 11 Home Single Language (Build 10.0.26200 / 25H2, 64-bit).
+* **Processor (CPU):** 12th Gen Intel(R) Core(TM) i5-1235U.
+  * **Total Physical Cores:** 10 cores (2 Performance-cores supporting Hyper-Threading [4 threads] + 8 Efficient-cores [8 threads]).
+  * **Total Logical Processors:** 12 logical threads.
+  * **Clock Speed:** Base 1.30 GHz (E-cores) / 1.70 GHz (P-cores), Turbo up to 4.40 GHz.
+  * **Architectural Constraint & Limitation:** Intel Alder Lake hybrid P/E core architecture introduces heterogeneous core performance. Foreground OS scheduling or background thread assignment between P and E cores can cause inter-trial execution variance. This is documented explicitly in the paper's threats to validity.
+* **Host RAM:** 16,440 MB (~16.0 GB total visible physical RAM). Typically ~3.6 GB to ~6.0 GB free prior to starting heavy containers.
+* **Storage (Disk C:):** NTFS filesystem, 475.6 GB total, **272.8 GB free** (ample headroom for container caches, Minikube VM state, and raw logs).
 
-| Component | Pinned Version | Source / Image / Registry | Status |
+### Docker Desktop & WSL2 Resource Allocation
+* **WSL2 / Docker VM Allocation (`docker info`):**
+  * **Allocated CPUs:** 12 logical CPUs.
+  * **Allocated Memory:** 8,157,372,416 bytes (~7.6 GB RAM).
+* **Minikube Cluster Profile (`scripts/setup-cluster.ps1` defaults):**
+  * **Driver:** Docker driver (runs as a Docker container within WSL2).
+  * **CPU Allocation:** **4 CPUs** (leaves 8 threads for host OS, Docker background workers, and k6 generator).
+  * **Memory Allocation:** **6,144 MB (6.0 GB)** (leaves ~1.6 GB in the WSL2 VM and ~8.4 GB for Windows host operations).
+
+### Realistic Cluster Sizing & Maximum Replicas without Pending Pods
+* **System Overhead inside Minikube:**
+  * Control-plane components + metrics-server: ~400m CPU, ~800 MiB RAM.
+  * `kube-prometheus-stack` (Prometheus Operator, Prometheus Server, Alertmanager): ~500m CPU, ~1,200 MiB RAM.
+  * KEDA Operator + Metrics Adapter: ~200m CPU, ~250 MiB RAM.
+  * Forecaster Microservice (Arm B): ~300m CPU request, ~500 MiB RAM.
+  * **Total Fixed Cluster Overhead:** ~1,400m CPU, ~2,750 MiB RAM.
+* **Remaining Headroom for Workload App Pods:**
+  * **CPU Headroom:** $4,000\text{m} - 1,400\text{m} = \mathbf{2,600\text{m} \text{ CPU}}$.
+  * **RAM Headroom:** $6,144\text{ MiB} - 2,750\text{ MiB} = \mathbf{3,394\text{ MiB} \text{ RAM}}$.
+* **Workload Pod Resource Envelope (frozen across both Arm A and Arm B):**
+  * `resources.requests`: CPU `100m`, Memory `128Mi`.
+  * `resources.limits`: CPU `500m`, Memory `256Mi`.
+* **Maximum Replicas Calculation:**
+  * By CPU requests: $2,600\text{m} / 100\text{m} = \mathbf{26\text{ replicas}}$.
+  * By RAM requests: $3,394\text{ MiB} / 128\text{ MiB} = \mathbf{26.5\text{ replicas}}$.
+* **Safe Operational Limit:**
+  * Set `minReplicas: 1` and `maxReplicas: 10` (or `12`).
+  * At 10 replicas under peak burst, total pod requests consume $1,000\text{m}$ CPU and $1,280\text{ MiB}$ RAM.
+  * This guarantees **zero `Pending` pods due to node scheduling starvation**. Pod provisioning delay ($D_{provision}$) will reflect pure container creation and startup latency, completely uncorrupted by resource queuing.
+
+### Realistic Per-Run Time & Campaign Time Estimates
+Every individual experimental run follows a strict sequential lifecycle:
+1. **Pre-flight & Reset:** Verify preconditions (idle CPU, reachable endpoints), drain previous pods, reset deployment to `replicas: 1`, wait for ready state: **60 s**.
+2. **Warm-up / Baseline Ingestion:** Generator begins at steady baseline load; establishes baseline metrics in Prometheus: **90 s**.
+3. **Scored Measurement Window:** Fixed evaluation duration per brief: **300 s (5.0 min)**.
+4. **Cool-down Phase:** Offload demand, allow queues to settle: **30 s**.
+5. **Telemetry Collection & Ingestion:** Pull pod lifecycle events, query Prometheus series, export raw JSON/CSV, verify integrity: **30 s**.
+* **Total Time per Experimental Run:** $\mathbf{510\text{ s} \approx 8.5\text{ minutes}}$.
+
+#### Campaign Duration Calculations
+* **Design Matrix:** 5 workload patterns (Stable, Periodic, Gradual, Bursty, Noisy) $\times$ 2 arms (Arm A: HPA CPU, Arm B: Prophet+KEDA) $\times$ 5 repetitions.
+* **Block 1 Campaign (50 runs):**
+  $$50\text{ runs} \times 8.5\text{ min} = 425\text{ minutes} = \mathbf{7.1\text{ hours}}.$$
+* **Optional Block 2 Campaign (additional 50 runs, 100 runs total):**
+  $$100\text{ runs} \times 8.5\text{ min} = 850\text{ minutes} = \mathbf{14.2\text{ hours}}.$$
+* **Ancillary Validation Runs:**
+  * Pilot runs (1–2 reps across conditions): $\sim 10\text{ runs} \approx 1.5\text{ hours}$.
+  * Dev parameter tuning (dev seeds only): $\sim 20\text{ runs} \approx 2.8\text{ hours}$.
+  * Negative Tests (NT-1 through NT-5): $\sim 15\text{ runs} \approx 2.1\text{ hours}$.
+* **Total End-to-End Time:**
+  * Core campaign (Pilot + Tuning + Block 1 + NTs): $\approx \mathbf{13.5\text{ hours}}$.
+  * Maximum campaign (including Block 2): $\approx \mathbf{20.6\text{ hours}}$.
+* **Feasibility Conclusion:**
+  * **Fits comfortably within 2–3 days of machine time.** Block 1 can execute completely overnight. The runner will be built to be resumable and append-only, saving each run's raw artifacts to disk immediately upon completion.
+
+---
+
+## 2. Laptop Run Protocol and Host Environmental Controls
+
+Running continuous benchmarking on a consumer laptop introduces thermal throttling and scheduling noise. To ensure experimental validity:
+1. **Power Supply:** Laptop must remain plugged into AC mains power at all times. Running on battery drops CPU frequencies and alters clock stepping.
+2. **Windows Power Profile:** Set Windows Power Mode to **"Best Performance"** (`Power & battery` settings).
+3. **Sleep & Screen Timeout:** Configure Windows Sleep to **"Never"** when plugged in; disable automatic screen turn-off or hibernation.
+4. **Application Isolation:** Close all non-essential applications (browsers, Discord, IDE background indexing, cloud sync agents like OneDrive) before launching campaigns.
+5. **Pre-Run Idle-CPU Precondition:** The automated campaign runner must check host CPU utilization prior to starting each run. If 10-second average CPU utilization exceeds **10%**, the runner will pause and wait up to 3 minutes for background tasks to settle before proceeding, or fail with a precondition error.
+6. **Hardware Heterogeneity Limitation:** Document in the paper that experiments were conducted on a heterogeneous 10-core (2P + 8E) Intel Core i5 processor, where OS thread scheduling between performance and efficiency cores may introduce latency dispersion.
+
+---
+
+## 3. Automation Strategy: Windows / PowerShell Equivalents for `make`
+
+An audit confirmed that **GNU `make` is NOT installed** on this Windows host.
+Rather than forcing external third-party toolchains (like MSYS2 or Chocolatey make), all project workflows will be supported with:
+1. A cross-platform **Python automation runner (`run.py`)** or standard **Makefile** (for CI/Linux users).
+2. Native **PowerShell automation scripts** located in `scripts/`:
+   * `scripts/run-demo.ps1` (equivalent to `make demo`): runs the 10-minute live demonstration comparing Arm A vs. Arm B on periodic/bursty load with live console telemetry.
+   * `scripts/run-reproduce.ps1` (equivalent to `make reproduce`): clean-room execution of the entire setup, calibration, and validation pipeline.
+   * `scripts/run-analyze.ps1` (equivalent to `make analyze`): invokes `analysis/compute_kpis.py` and `analysis/plot_figures.py` to regenerate all tables and figures from `results/raw/`.
+
+---
+
+## 4. Pinned Component Versions with Verification Proofs
+
+All pinned versions have been empirically verified on the local host and upstream registries:
+
+| Component | Pinned Version | Verification Command | Actual Command Output Proof |
 |---|---|---|---|
-| **Kubernetes (Minikube)** | `v1.35.1` (or `v1.36.1`) | minikube Docker driver / `registry.k8s.io` | Verified running |
-| **KEDA (Helm Chart)** | `2.21.0` | `kedacore/keda` (`https://kedacore.github.io/charts`) | Pinned |
-| **kube-prometheus-stack** | `92.1.1` | `prometheus-community/kube-prometheus-stack` | Pinned |
-| **k6** | `v2.2.0` (commit `00a9a1b7f5`) | Local official installation (`C:\Program Files\k6\k6.exe`) | Verified installed |
-| **Python** | `3.12.7` / base `python:3.12-slim` | Official Docker Hub | Verified installed |
-| **Prophet** | `1.5.0` | PyPI (`prophet==1.5.0`) | Verified current |
-| **FastAPI** | `0.142.2` | PyPI (`fastapi==0.142.2`) | Verified installed |
-| **Uvicorn** | `0.54.0` | PyPI (`uvicorn[standard]==0.54.0`) | Verified installed |
-| **Prometheus Client (Python)** | `0.26.0` | PyPI (`prometheus-client==0.26.0`) | Verified installed |
-| **Pytest** | `9.1.1` | PyPI (`pytest==9.1.1`) | Verified installed |
+| **Minikube** | `v1.38.1` | `minikube version` | `minikube version: v1.38.1 commit: c93a4cb9311efc66b90d33ea03f75f2c4120e9b0` |
+| **Kubernetes (Client)** | `v1.36.1` | `kubectl version --client` | `Client Version: v1.36.1 Kustomize Version: v5.8.1` |
+| **Kubernetes (Minikube)**| `v1.35.1` (or `v1.36.1`) | `minikube start --help` | Supports official `v1.35.1` / dynamic `v1.36.1` preload |
+| **Helm** | `v4.2.4` | `helm version` | `version.BuildInfo{Version:"v4.2.4", GitCommit:"3900f434fd3ef2b84065dc04508df48f288dba00", ...}` |
+| **Docker Desktop / Engine**| `4.88.1` / `29.7.2` | `docker version` | `Server: Docker Desktop 4.88.1 Engine: Version 29.7.2 API version: 1.55` |
+| **k6** | `v2.2.0` | `k6 version` | `k6.exe v2.2.0 (commit/00a9a1b7f5, go1.26.5, windows/amd64)` |
+| **KEDA Helm Chart** | `2.21.0` | `helm search repo kedacore/keda --versions` | `kedacore/keda 2.21.0 2.21.0 Event-based autoscaler for workloads on Kubernetes` |
+| **kube-prometheus-stack**| `92.1.1` | `helm search repo prometheus-community/kube-prometheus-stack --versions` | `prometheus-community/kube-prometheus-stack 92.1.1 v0.94.1 kube-prometheus-stack collects ...` |
+| **Python** | `3.12.7` | `python --version` | `Python 3.12.7` |
+| **FastAPI** | `0.142.2` | `python -m pip index versions fastapi` | PyPI verified: `0.142.2` |
+| **Uvicorn** | `0.54.0` | `python -m pip index versions uvicorn` | PyPI verified: `0.54.0` |
+| **Starlette** | `1.7.0` | `python -m pip index versions starlette` | PyPI verified: `1.7.0` |
+| **prometheus-client** | `0.26.0` | `python -m pip index versions prometheus-client` | PyPI verified: `0.26.0` |
+| **pytest** | `9.1.1` | `python -m pip index versions pytest` | PyPI verified: `9.1.1` |
+| **pytest-asyncio** | `1.4.0` | `python -m pip index versions pytest-asyncio` | PyPI verified: `1.4.0` |
+| **httpx** | `0.28.1` | `python -m pip index versions httpx` | PyPI verified: `0.28.1` |
+| **anyio** | `4.9.0` | `python -m pip index versions anyio` | PyPI verified: `4.9.0` |
+| **Prophet** | `1.5.0` | `python -m pip index versions prophet` | `prophet (1.5.0) Available: 1.5.0, 1.4.0, ... LATEST: 1.5.0` |
+| **cmdstanpy** | `1.3.0` | `python -m pip index versions cmdstanpy` | PyPI verified: `1.3.0` |
+| **PyTorch (LSTM CPU)** | `2.14.1+cpu` (or `2.14.1`) | `python -m pip index versions torch` | PyPI verified: `torch==2.14.1` (lightweight CPU build for O2 baseline) |
+| **numpy** | `2.5.4` | `python -m pip index versions numpy` | PyPI verified: `2.5.4` |
+| **pandas** | `3.0.6` | `python -m pip index versions pandas` | PyPI verified: `3.0.6` |
+| **scipy** | `1.18.1` | `python -m pip index versions scipy` | PyPI verified: `1.18.1` |
+| **statsmodels** | `0.15.0` | `python -m pip index versions statsmodels` | PyPI verified: `0.15.0` |
+| **matplotlib** | `3.11.2` | `python -m pip index versions matplotlib` | PyPI verified: `3.11.2` |
 
 ---
 
-## 2. Project Phases and Deliverables (P0 → P7)
+## 5. Project Phases, Deliverables, and Rough Effort Estimates
 
-```
-[P0 Audit & Plan] ➔ [P1 O1 Baseline & SLO] ➔ [P2 Workloads & O2 Forecaster] ➔ [P3 O3 Predictive Scaler]
-        │
-        ▼
-[P4 O4 Campaign Runner & Pilot] ➔ [P5 O5 Negative Tests & Degraded Mode] ➔ [P6 Analysis & Acceptance] ➔ [P7 Paper & Reproducibility]
-```
-
-### Phase P0: Environment Audit, Discrepancy Reconciliation & Master Plan
-* **Status:** In Progress.
-* **Deliverables:** Hardware audit, machine capacity model, campaign time model, `docs/SPEC_NOTES.md`, `PLAN.md`.
-
-### Phase P1 (O1): Cluster Scaffolding, App, Load Generator, Baseline HPA, and Calibration
-* **Focus:** Build and calibrate the foundation.
-* **Deliverables:**
-  * Automated cluster setup script (`scripts/setup-cluster.ps1`).
-  * FastAPI workload app (`app/main.py`), containerized and pre-loaded.
-  * Open-loop k6 arrival-rate scripts (`workloads/k6_generator.js`).
-  * Runner skeleton tracking $t_0$, $t_{onset}$, offered vs. achieved rate, and Kubernetes pod lifecycle events.
-  * Baseline HPA (CPU) deployment reproducing reactive lag under a step load (`results/raw/o1/`).
-  * Calibration of sustainable per-pod capacity and freezing of `docs/SLO.md` and `docs/METRICS.md`.
-  * Unit tests for metric formulas against an independent synthetic oracle.
-* **Gate 1 Evidence:** Baseline lag plot, raw trace files, passing tests, frozen SLO doc.
-
-### Phase P2 (O2): Workload Generative Specs, Predictability Quantifiers & Forecaster Comparison
-* **Focus:** Synthesize workloads and benchmark time-series forecasters.
-* **Deliverables:**
-  * Five generative workload specifications (Stable, Periodic, Gradual, Bursty, Noisy) in `workloads/SPEC.md`.
-  * Independent warm-up history traces and acceptance seeds (hashed before tuning).
-  * Workload predictability metrics (spectral entropy, dominant-lag autocorrelation, seasonal-naive MASE).
-  * Real trace comparison against public traces (e.g. NASA-HTTP / Wikimedia) validating realism.
-  * O2 offline forecaster comparison: Prophet (custom short-period seasonality) vs. LSTM vs. Seasonal-Naive on 60 s horizon.
-  * `docs/O2_reference.md` documenting accuracy, fit time, memory, and selection rationale.
-* **Gate 2 Evidence:** Model comparison benchmark tables, seed hash records, oracle test suite.
-
-### Phase P3 (O3): Forecaster Microservice & KEDA Predictive Scaler Integration
-* **Focus:** Deploy live proactive autoscaling on Kubernetes.
-* **Deliverables:**
-  * Containerized Forecaster service querying Prometheus, refitting periodically, and exposing `forecast_request_rate_60s` with staleness/health telemetry.
-  * KEDA `ScaledObject` (Prometheus trigger) configuring proactive scaling for Arm B.
-  * Strict controller fairness configuration in `docs/FAIRNESS.md` (identical min/max replicas, scale-down stabilization, polling intervals).
-  * Pre-run configuration validator script.
-  * Vertical slice demonstration: Bursty run for Arm A vs. Arm B on a single time axis.
-* **Gate 3 Evidence:** Time-aligned multi-panel plot (offered load, forecast, desired/ready replicas, latency), fairness check output.
-
-### Phase P4 (O4): Experiment Campaign Execution & Pilot
-* **Focus:** Execute the randomized comparative evaluation.
-* **Deliverables:**
-  * Resumable, append-only campaign runner (`runner/campaign.py`) with pre-flight checks, automatic invalidation logging, and per-run telemetry capture.
-  * Pilot campaign (1–2 reps per pattern × arm) verifying that $\ge 2$ scale-out events occur per run and measuring exact reset overhead.
-  * Protocol freezing document (`docs/PROTOCOL_FROZEN.md`) with commit hash and frozen seed manifest.
-  * Execution of Block 1 (50 final runs: 5 patterns × 2 arms × 5 reps).
-* **Gate 4 Evidence:** Pilot verification report, raw run directories in `results/raw/block1/`, integrity audit report.
-
-### Phase P5 (O5): Negative Testing, Fault Injection & Degraded Mode
-* **Focus:** Verify resilience, failure semantics, and safety guardrails.
-* **Deliverables:**
-  * Scripted test harnesses for NT-1 (forecast errors causing under-provisioning), NT-2 (scaling lag and cold starts), NT-3 (synthetic load non-resemblance), NT-4 (control-plane/dependency outage), and NT-5 (configuration drift).
-  * Degraded-mode fallback mechanism (seamless fallback to reactive triggers on forecaster unavailability).
-  * Evidence recorded in `results/raw/nt/` and summarized in `acceptance/negative_tests.md`.
-* **Gate 5 Evidence:** Scripted fault logs, recovery time measurements, zero-silent-loss proofs.
-
-### Phase P6: Analysis Pipeline, KPI Synthesis & Acceptance Report
-* **Focus:** Script-driven statistical analysis and figure generation.
-* **Deliverables:**
-  * Python analysis pipeline (`make analyze` / `analysis/compute_kpis.py`) transforming `results/raw/` to `results/processed/`.
-  * KPI-1 through KPI-6 summary table with medians, IQRs, bootstrap 95% CIs, Mann-Whitney U tests, and Holm corrections.
-  * Empirical answers to RQ1, RQ2 (H2), and RQ3 (H3) with publication-quality 300 dpi figures.
-  * Final acceptance document (`docs/ACCEPTANCE_REPORT.md`) verifying AC-1 through AC-4.
-* **Gate 6 Evidence:** Fully automated build reproducing all figures and tables from raw logs.
-
-### Phase P7: Paper Completion, Reproducibility Package & Mentor Demo
-* **Focus:** Publication integration and defense preparation.
-* **Deliverables:**
-  * IEEE research paper Sections V (Setup), VI (Results), VII (Discussion), VIII (Threats/Limitations), and IX (Conclusion), with direct data traces for all numerical values.
-  * Reproducibility package (`make reproduce`, evidence manifest, quick-start guide).
-  * Mentor demo script (10–12 minute live comparison of Arm A vs Arm B on Bursty and Periodic patterns).
-  * Viva defense guide with anticipated examiner questions and honest technical answers.
-* **Gate 7 Evidence:** Clean-room reproduction run, finalized paper draft, demo walkthrough.
+| Phase | Description & Core Deliverables | Rough Effort Estimate |
+|---|---|---|
+| **P0** | **Environment Audit, Discrepancy Reconciliation & Master Plan**<br>Hardware audit, machine capacity model, campaign time model, `docs/SPEC_NOTES.md`, `PLAN.md`. | ~4–6 hours (Completed) |
+| **P1 (O1)** | **Cluster, App, Load Generator, Baseline HPA, and Calibration**<br>Automate cluster deployment, build FastAPI app, create open-loop k6 scripts, reproduce HPA reactive lag, calibrate sustainable per-pod capacity, freeze `docs/SLO.md` and `docs/METRICS.md`, write oracle unit tests. | ~8–12 engineering hours |
+| **P2 (O2)** | **Workloads, Predictability Quantifiers & Forecaster Comparison**<br>Generative specs for 5 patterns in `workloads/SPEC.md`, dev/acceptance seed generation and hashing, predictability metrics, real-trace validation, offline comparison of Prophet vs. LSTM vs. Seasonal-Naive on 60 s horizon, write `docs/O2_reference.md`. | ~10–14 engineering hours |
+| **P3 (O3)** | **Forecaster Service & KEDA Predictive Scaler Integration**<br>Containerized Forecaster service, KEDA `ScaledObject` for Arm B, strict controller fairness configuration in `docs/FAIRNESS.md`, config validator, vertical slice demonstration plot (bursty run Arm A vs Arm B). | ~10–12 engineering hours |
+| **P4 (O4)** | **Experiment Campaign Runner & Campaign Execution**<br>Resumable append-only campaign runner, pilot runs (1–2 reps), real overhead measurement, protocol freezing document (`docs/PROTOCOL_FROZEN.md`), execution of Block 1 (50 runs). | ~8 engineering hours + ~8–10 machine runtime hours |
+| **P5 (O5)** | **Negative Tests, Degraded Mode & Recovery**<br>Scripted fault injection for NT-1 through NT-5, degraded-mode fallback implementation and verification, recovery measurements in `results/raw/nt/`, `acceptance/negative_tests.md`. | ~8–10 engineering hours |
+| **P6** | **Analysis Pipeline, KPI Synthesis & Acceptance**<br>Script-driven analysis pipeline, compute KPI-1 through KPI-6 with bootstrap 95% CIs and Holm correction, RQ1–RQ3 answers, generate 300 dpi publication plots, write `docs/ACCEPTANCE_REPORT.md`. | ~10–14 engineering hours |
+| **P7** | **Paper Sections, Reproducibility Package & Mentor Demo**<br>Complete IEEE paper Sections V–IX directly from CSV results, create reproducibility package (`scripts/run-reproduce.ps1`), 10-minute mentor demo script (`scripts/run-demo.ps1`), viva Q&A defense document. | ~12–16 engineering hours |
 
 ---
 
-## 3. Repository Scaffolding
+## 6. Repository Layout
 
 ```
 predictive-k8s-autoscaling/
@@ -150,25 +190,14 @@ predictive-k8s-autoscaling/
 │   ├── FAIRNESS.md
 │   ├── PROTOCOL_FROZEN.md
 │   └── ACCEPTANCE_REPORT.md
-├── scripts/              # Utility and cluster setup scripts
-│   └── setup-cluster.ps1
-├── Makefile              # Automation targets: setup, test, run, analyze, demo, reproduce
+├── scripts/              # PowerShell automation scripts (setup, demo, reproduce, analyze)
+│   ├── setup-cluster.ps1
+│   ├── run-demo.ps1
+│   ├── run-reproduce.ps1
+│   └── run-analyze.ps1
+├── Makefile              # CI / Linux automation target wrapper
+├── run.py                # Cross-platform entrypoint (Python task runner)
 ├── PROJECT_BRIEF.md      # Master research rules and non-negotiables
 ├── PLAN.md               # Master phase schedule and risk model
 └── CHANGELOG.md          # Chronological record of major changes
 ```
-
----
-
-## 4. Key Milestones and Review Gates
-
-| Gate | Phase | Milestone Output | Verification Criteria |
-|---|---|---|---|
-| **Gate 0** | P0 | Environment & Plan | Machine audit approved; `SPEC_NOTES.md` and `PLAN.md` verified. |
-| **Gate 1** | P1 | Baseline & Frozen SLO | HPA reactive lag reproduced; sustainable capacity calibrated; SLO frozen. |
-| **Gate 2** | P2 | Workloads & O2 Forecaster | 5 workload traces characterized; Prophet vs. LSTM offline trade-off evaluated. |
-| **Gate 3** | P3 | Live Predictive Scaler | Arm B live vertical slice demonstrates proactive scaling; controller fairness validated. |
-| **Gate 4** | P4 | Block 1 Experiment Campaign | Pilot completed; 50 comparative runs executed across 5 patterns × 2 arms. |
-| **Gate 5** | P5 | Negative Testing | NT-1 through NT-5 fault injection evaluated; degraded-mode verified. |
-| **Gate 6** | P6 | Analysis & Statistical KPIs | KPI-1 through KPI-6 computed with bootstrap CIs; RQ1–RQ3 figures generated. |
-| **Gate 7** | P7 | Paper & Defense Package | IEEE paper sections completed from data; `make demo` and `make reproduce` verified. |
