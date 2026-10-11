@@ -1,0 +1,79 @@
+[
+  {
+    "replicas": 1,
+    "offered_rate": 5,
+    "achieved_rate": 5.04,
+    "failed_rate": 0,
+    "avg_ms": 25.19,
+    "med_ms": 23.99,
+    "p90_ms": 29.67,
+    "p95_ms": 31.04,
+    "top_pods": "workload-app-6fdcb8557-f7jkp   32m   38Mi"
+  },
+  {
+    "replicas": 1,
+    "offered_rate": 10,
+    "achieved_rate": 10.03,
+    "failed_rate": 0,
+    "avg_ms": 24.39,
+    "med_ms": 23.61,
+    "p90_ms": 26.08,
+    "p95_ms": 30.43,
+    "top_pods": "workload-app-6fdcb8557-f7jkp   32m   38Mi"
+  },
+  {
+    "replicas": 1,
+    "offered_rate": 15,
+    "achieved_rate": 15.0,
+    "failed_rate": 0,
+    "avg_ms": 24.32,
+    "med_ms": 23.9,
+    "p90_ms": 25.77,
+    "p95_ms": 28.41,
+    "top_pods": "workload-app-6fdcb8557-f7jkp   145m   39Mi"
+  },
+  {
+    "replicas": 4,
+    "offered_rate": 20,
+    "achieved_rate": 20.02,
+    "failed_rate": 0,
+    "avg_ms": 23.54,
+    "med_ms": 23.22,
+    "p90_ms": 24.34,
+    "p95_ms": 25.98,
+    "top_pods": "workload-app-6fdcb8557-9z86r   26m    38Mi   \nworkload-app-6fdcb8557-f7jkp   266m   39Mi   \nworkload-app-6fdcb8557-mj8nw   24m    38Mi   \nworkload-app-6fdcb8557-qdshv   26m    38Mi"
+  },
+  {
+    "replicas": 4,
+    "offered_rate": 35,
+    "achieved_rate": 34.98,
+    "failed_rate": 0,
+    "avg_ms": 52.47,
+    "med_ms": 53.27,
+    "p90_ms": 73.04,
+    "p95_ms": 84.36,
+    "top_pods": "workload-app-6fdcb8557-9z86r   26m    38Mi   \nworkload-app-6fdcb8557-f7jkp   266m   39Mi   \nworkload-app-6fdcb8557-mj8nw   24m    38Mi   \nworkload-app-6fdcb8557-qdshv   26m    38Mi"
+  },
+  {
+    "replicas": 10,
+    "offered_rate": 50,
+    "achieved_rate": 49.88,
+    "failed_rate": 0,
+    "avg_ms": 136.22,
+    "med_ms": 127.19,
+    "p90_ms": 203.58,
+    "p95_ms": 238.03,
+    "top_pods": "workload-app-6fdcb8557-5vdxb   69m    38Mi   \nworkload-app-6fdcb8557-9z86r   2m     38Mi   \nworkload-app-6fdcb8557-f7jkp   266m   39Mi   \nworkload-app-6fdcb8557-gvlsg   21m    37Mi   \nworkload-app-6fdcb8557-mj8nw   2m     38Mi   \nworkload-app-6fdcb8557-n4gz9   68m    37Mi   \nworkload-app-6fdcb8557-p6v78   67m    37Mi   \nworkload-app-6fdcb8557-qdshv   2m     38Mi   \nworkload-app-6fdcb8557-tkff4   21m    37Mi   \nworkload-app-6fdcb8557-w2f59   67m    37Mi"
+  },
+  {
+    "replicas": 10,
+    "offered_rate": 80,
+    "achieved_rate": 58.1,
+    "failed_rate": 0,
+    "avg_ms": 2000.52,
+    "med_ms": 1530.47,
+    "p90_ms": 2389.54,
+    "p95_ms": 5135.91,
+    "top_pods": "workload-app-6fdcb8557-5vdxb   69m    38Mi   \nworkload-app-6fdcb8557-9z86r   2m     38Mi   \nworkload-app-6fdcb8557-f7jkp   266m   39Mi   \nworkload-app-6fdcb8557-gvlsg   21m    37Mi   \nworkload-app-6fdcb8557-mj8nw   2m     38Mi   \nworkload-app-6fdcb8557-n4gz9   68m    37Mi   \nworkload-app-6fdcb8557-p6v78   67m    37Mi   \nworkload-app-6fdcb8557-qdshv   2m     38Mi   \nworkload-app-6fdcb8557-tkff4   21m    37Mi   \nworkload-app-6fdcb8557-w2f59   67m    37Mi"
+  }
+]

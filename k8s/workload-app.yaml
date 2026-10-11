@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workload
+  labels:
+    monitoring: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workload-app
+  namespace: workload
+  labels:
+    app: workload-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: workload-app
+  template:
+    metadata:
+      labels:
+        app: workload-app
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: workload-app
+          image: workload-app:latest
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: WORK_MS
+              value: "20"
+            - name: STARTUP_DELAY_SECONDS
+              value: "5"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workload-app
+  namespace: workload
+  labels:
+    app: workload-app
+spec:
+  type: ClusterIP
+  selector:
+    app: workload-app
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: workload-app
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - workload
+  selector:
+    matchLabels:
+      app: workload-app
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

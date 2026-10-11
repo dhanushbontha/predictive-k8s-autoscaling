@@ -4,7 +4,7 @@
 > 1. Put it in the repo root (`predictive-k8s-autoscaling`) and also drop the capstone spec PDF and the paper draft (.docx) into `docs/`.
 > 2. Start the agent with: *"Read PROJECT_BRIEF.md fully, then docs/ (spec PDF + paper draft). Confirm you understood by summarising the locked design in 10 lines. Do nothing else yet."*
 > 3. Then paste the **Phase prompts (P0 → P7)** from the bottom of this file **one at a time**. Review each gate before pasting the next.
-> 4. Model tip: Opus 4.6 for P0, P2 (design), P6, P7 (analysis + paper text). Sonnet 4.6 for the scaffolding/implementation phases (P1, P3, P4, P5).
+> 4. Model tip: use the strongest model available (Gemini 3.1 Pro) for P0, P2 (design), P6 and P7 (analysis + paper text), and for anything where correctness of the measurements matters. Gemini 3.8 Flash is fine for routine scaffolding and small edits (parts of P1, P3, P5), but switch to Pro for the experiment runner, the metric code and all analysis.
 > 5. Run long experiment campaigns in a normal terminal (not inside the chat), so they survive agent context resets. The agent writes the runner; you launch it.
 
 ---
@@ -117,7 +117,7 @@ Makefile  README.md  requirements.lock  PLAN.md  CHANGELOG.md
 
 # PART 2 — PHASE PROMPTS (paste one at a time)
 
-## P0 — Environment audit and plan  *(Opus 4.6)*
+## P0 — Environment audit and plan  
 ```
 Read PROJECT_BRIEF.md fully, then the spec PDF and the paper draft in docs/.
 1) Summarise the locked design in 10 lines and list anything in the brief/spec/draft that is ambiguous, inconsistent, or risky. Put spec inconsistencies in docs/SPEC_NOTES.md.
@@ -127,7 +127,7 @@ Read PROJECT_BRIEF.md fully, then the spec PDF and the paper draft in docs/.
 Stop and wait for approval.
 ```
 
-## P1 — O1: cluster, app, load generator, baseline HPA, calibration  *(Sonnet 4.6)*
+## P1 — O1: cluster, app, load generator, baseline HPA, calibration  
 ```
 Implement Phase O1 per PROJECT_BRIEF.md.
 - Create the local cluster, install metrics-server, Prometheus, and KEDA (pinned, scripted in Makefile).
@@ -139,7 +139,7 @@ Implement Phase O1 per PROJECT_BRIEF.md.
 Gate 1 evidence: plot + raw files for the baseline, tests passing, frozen SLO. Stop and wait.
 ```
 
-## P2 — Workloads, predictability, and O2 forecaster comparison  *(Opus 4.6 for design, Sonnet for code)*
+## P2 — Workloads, predictability, and O2 forecaster comparison  
 ```
 Implement the five workload generators (stable, periodic, gradually changing, bursty, noisy) with explicit parameters and seeds in workloads/SPEC.md. Generate: (a) a separate warm-up/history trace per pattern and seed, (b) dev seeds and acceptance seeds (generate and hash the acceptance seeds now; do not look at results from them).
 Compute a quantitative predictability/forecastability measure per pattern (see brief rule 8).
@@ -149,25 +149,25 @@ Add tests with an independent oracle (known-signal fixtures with known forecast 
 Gate 2 evidence + stop.
 ```
 
-## P3 — O3: forecaster service + KEDA predictive scaler  *(Sonnet 4.6)*
+## P3 — O3: forecaster service + KEDA predictive scaler  
 ```
 Build the forecaster as a containerised service that reads request-rate history from Prometheus, refits on a fixed cadence, and exposes forecast_request_rate_60s plus forecast origin/target timestamps, forecast latency, and a staleness metric. Build the KEDA ScaledObject (Prometheus scaler) for Arm B. Make Arms A and B share the same HPA behavior policy (including the same scale-down setting), min/max replicas and polling interval, and write a config-diff table to docs/FAIRNESS.md. Add a config validator (script) that refuses to start a run if arms differ in anything other than the intended factor.
 Demonstrate a vertical slice: one bursty run per arm, with a figure of offered load, forecast, replicas (desired vs ready), and latency on one time axis. Include a small ablation/sensitivity (e.g. refit cadence or history window) on DEV seeds only.
 Evidence + stop.
 ```
 
-## P4 — O4: experiment campaign  *(Sonnet 4.6, then you run it)*
+## P4 — O4: experiment campaign  *(then you run it)*
 ```
 Finish the resumable, append-only campaign runner (randomised/interleaved order, precondition checks, automatic invalidation with reason, per-run directories). Run the PILOT (1-2 reps per pattern x arm) and report: do runs behave sanely? does the 300 s window contain at least 2 scale-out events on bursty and gradual patterns? are offered/achieved rates matched? Report the real per-run overhead (reset, warm-up, cool-down). Do NOT change the 300 s window or the 60 s horizon; report and wait if there is a problem.
 After my approval: write docs/PROTOCOL_FROZEN.md (all parameters, seeds, commit hash, acceptance-seed hash), commit and push it, and give me the exact command to launch the full campaign in my own terminal (dev tuning first on dev seeds, then block 1: 50 runs on the first 5 acceptance seeds, exactly once; block 2 only on my explicit go). Provide a progress/status command and a resume command.
 ```
 
-## P5 — O5: negative tests, degraded mode, recovery  *(Sonnet 4.6)*
+## P5 — O5: negative tests, degraded mode, recovery  
 ```
 Implement NT1-NT5 as scripted fault injections with fixture IDs, preconditions, expected vs observed behaviour, recovery time, and residual-risk notes (brief Section 5). Implement and test the degraded-mode fallback (forecaster stale/unavailable -> reactive trigger) and the drift checker for NT5. Store evidence under results/raw/nt/ and write acceptance/negative_tests.md from the data. Be honest about any test where the system does not behave safely; that is a finding, not a failure to hide.
 ```
 
-## P6 — Analysis, KPIs, acceptance  *(Opus 4.6)*
+## P6 — Analysis, KPIs, acceptance  
 ```
 Build the analysis pipeline (make analyze) from raw results to processed tables and figures only through scripts. Produce:
 - KPI-1...KPI-6 table: baseline (Arm A, HPA) vs candidate (Arm B, Prophet+KEDA), per pattern, median/IQR, deltas with bootstrap 95% CI, Mann-Whitney p with Holm correction, effect size; pass/fail against the spec rules; list spec ambiguities again (SPEC_NOTES.md).
@@ -179,7 +179,7 @@ Build the analysis pipeline (make analyze) from raw results to processed tables 
 Describe what the data shows in plain words, including where predictive scaling did NOT help. No claim of causation. Flag anything surprising or suspicious in the data and check it (e.g. outliers, invalid runs, clock issues) before interpreting.
 ```
 
-## P7 — Paper sections, reproducibility package, mentor demo  *(Opus 4.6)*
+## P7 — Paper sections, reproducibility package, mentor demo  
 ```
 1) Paper: write Section V (Experimental Setup: cluster, versions, application, workload table, parameters, fairness config, SLO definition, repetitions, statistics), Section VI (Results, RQ1-RQ3, H1-H3 stated as supported / not supported / partly supported by the data), Section VII (Discussion), Section VIII (Threats to validity and limitations: single-host cluster, 1 s timestamp resolution, synthetic workloads, fixed 60 s horizon and 300 s window, one forecaster in the main study, HPA-vs-KEDA differing in scaling metric and controller path as well as in forecasting, 5 repetitions per condition, scale-up behaviour only, etc.), Section IX (Conclusion). Match the existing draft's IEEE style and equation numbering. Every number must come from results/processed/*.csv; add a comment next to each number with its source file. Do not invent references: if you need more citations, list them as "TODO: verify" for me to look up. Also propose a small addition to Section IV-F describing the onset-relative metric and lead-time slack.
 2) Reproducibility: make reproduce (clean environment, pinned versions, seeds, scripted runbook), evidence manifest, operating guide, README with a quick-start.

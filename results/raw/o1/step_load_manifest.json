@@ -1,0 +1,135 @@
+{
+  "trial_id": "O1_BASELINE_STEP_HPA",
+  "arm": "Arm A (Reactive CPU HPA)",
+  "git_commit": "035a194af82d50a6821503b40d86f051f1724098",
+  "t0_epoch": 1791736994.3647778,
+  "t_onset_epoch": 1791737034.3647778,
+  "pod_delays": [
+    {
+      "pod_name": "workload-app-6fdcb8557-5qpw5",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737116.0,
+      "t_ready": 1791737128.0,
+      "D_E2E": 133.64,
+      "D_provision": 12.0,
+      "D_detect_sched": 121.64,
+      "D_onset": 93.64,
+      "lead_time_slack": 48.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-9z86r",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791736680.0,
+      "t_ready": 1791736689.0,
+      "D_E2E": -305.36,
+      "D_provision": 9.0,
+      "D_detect_sched": -314.36,
+      "D_onset": -345.36,
+      "lead_time_slack": 51.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-crbq9",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737116.0,
+      "t_ready": 1791737126.0,
+      "D_E2E": 131.64,
+      "D_provision": 10.0,
+      "D_detect_sched": 121.64,
+      "D_onset": 91.64,
+      "lead_time_slack": 50.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-gb6hv",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737116.0,
+      "t_ready": 1791737128.0,
+      "D_E2E": 133.64,
+      "D_provision": 12.0,
+      "D_detect_sched": 121.64,
+      "D_onset": 93.64,
+      "lead_time_slack": 48.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-hzgl2",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737116.0,
+      "t_ready": 1791737128.0,
+      "D_E2E": 133.64,
+      "D_provision": 12.0,
+      "D_detect_sched": 121.64,
+      "D_onset": 93.64,
+      "lead_time_slack": 48.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-j7hk7",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737101.0,
+      "t_ready": 1791737113.0,
+      "D_E2E": 118.64,
+      "D_provision": 12.0,
+      "D_detect_sched": 106.64,
+      "D_onset": 78.64,
+      "lead_time_slack": 48.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-mvxj4",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737041.0,
+      "t_ready": 1791737049.0,
+      "D_E2E": 54.64,
+      "D_provision": 8.0,
+      "D_detect_sched": 46.64,
+      "D_onset": 14.64,
+      "lead_time_slack": 52.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-mxzs8",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737101.0,
+      "t_ready": 1791737113.0,
+      "D_E2E": 118.64,
+      "D_provision": 12.0,
+      "D_detect_sched": 106.64,
+      "D_onset": 78.64,
+      "lead_time_slack": 48.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-snmkw",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737101.0,
+      "t_ready": 1791737113.0,
+      "D_E2E": 118.64,
+      "D_provision": 12.0,
+      "D_detect_sched": 106.64,
+      "D_onset": 78.64,
+      "lead_time_slack": 48.0
+    },
+    {
+      "pod_name": "workload-app-6fdcb8557-z866h",
+      "t0": 1791736994.3647778,
+      "t_onset": 1791737034.3647778,
+      "t_creation": 1791737101.0,
+      "t_ready": 1791737113.0,
+      "D_E2E": 118.64,
+      "D_provision": 12.0,
+      "D_detect_sched": 106.64,
+      "D_onset": 78.64,
+      "lead_time_slack": 48.0
+    }
+  ],
+  "summary": {
+    "total_samples": 110,
+    "peak_replicas": 10,
+    "max_probe_latency_ms": 187.0,
+    "total_slo_violations": 15
+  }
+}
