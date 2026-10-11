@@ -2,7 +2,7 @@
 runner/collector.py — Telemetry and Kubernetes state collector.
 
 Collects pod creation, ready timestamps, replica counts, and Prometheus metrics.
-Computes latency metrics, delay terms, and resource usage.
+Computes latency metrics, delay terms, allocated pod-seconds, and resource usage.
 """
 
 import json
@@ -23,6 +23,7 @@ def get_pod_events(namespace: str = "workload", label: str = "app=workload-app")
     for item in data.get("items", []):
         name = item["metadata"]["name"]
         creation = item["metadata"]["creationTimestamp"]
+        deletion = item["metadata"].get("deletionTimestamp")
         ready_time = None
         for cond in item.get("status", {}).get("conditions", []):
             if cond.get("type") == "Ready" and cond.get("status") == "True":
@@ -31,6 +32,7 @@ def get_pod_events(namespace: str = "workload", label: str = "app=workload-app")
         pods.append({
             "name": name,
             "creationTimestamp": creation,
+            "deletionTimestamp": deletion,
             "readyTimestamp": ready_time,
             "phase": item.get("status", {}).get("phase")
         })
@@ -54,14 +56,19 @@ def query_prometheus(query: str, prom_url: str = "http://127.0.0.1:9090") -> Any
             data = json.loads(resp.read().decode())
             if data.get("status") == "success":
                 return data.get("data", {}).get("result", [])
-    except Exception as e:
+    except Exception:
         return []
     return []
 
-def compute_delays(t0_epoch: float, t_onset_epoch: float, pod_events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    delays = []
-    from datetime import datetime, timezone
+def compute_delays(t0_epoch: float, t_onset_epoch: float, pod_events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Computes per-pod delays and summary statistics.
+    Filters pods created prior to t0 (pre-existing baseline pods).
+    Handles trials with no scale-out events cleanly.
+    """
+    from datetime import datetime
     
+    per_pod_delays = []
     for pod in pod_events:
         c_ts = pod.get("creationTimestamp")
         r_ts = pod.get("readyTimestamp")
@@ -72,13 +79,17 @@ def compute_delays(t0_epoch: float, t_onset_epoch: float, pod_events: List[Dict[
         t_creation = c_dt.timestamp()
         t_ready = r_dt.timestamp()
         
+        # Exclude baseline pods created before experiment start
+        if t_creation < t0_epoch - 2.0:
+            continue
+            
         d_e2e = t_ready - t0_epoch
         d_provision = t_ready - t_creation
         d_detect_sched = t_creation - t0_epoch
         d_onset = t_ready - t_onset_epoch
         lead_time_slack = 60.0 - d_provision
         
-        delays.append({
+        per_pod_delays.append({
             "pod_name": pod["name"],
             "t0": t0_epoch,
             "t_onset": t_onset_epoch,
@@ -90,21 +101,48 @@ def compute_delays(t0_epoch: float, t_onset_epoch: float, pod_events: List[Dict[
             "D_onset": round(d_onset, 2),
             "lead_time_slack": round(lead_time_slack, 2)
         })
-    return delays
+        
+    if not per_pod_delays:
+        return {
+            "scale_out_occurred": False,
+            "pods": [],
+            "median_D_E2E": None,
+            "median_D_provision": None,
+            "median_D_detect_sched": None,
+            "median_D_onset": None,
+            "median_lead_time_slack": None
+        }
+        
+    import statistics
+    return {
+        "scale_out_occurred": True,
+        "pods": per_pod_delays,
+        "median_D_E2E": round(statistics.median([p["D_E2E"] for p in per_pod_delays]), 2),
+        "median_D_provision": round(statistics.median([p["D_provision"] for p in per_pod_delays]), 2),
+        "median_D_detect_sched": round(statistics.median([p["D_detect_sched"] for p in per_pod_delays]), 2),
+        "median_D_onset": round(statistics.median([p["D_onset"] for p in per_pod_delays]), 2),
+        "median_lead_time_slack": round(statistics.median([p["lead_time_slack"] for p in per_pod_delays]), 2)
+    }
 
 def compute_cost_and_overprovisioning(samples: List[Dict[str, Any]], capacity_per_pod: float) -> Dict[str, float]:
-    total_pod_seconds = 0.0
+    """
+    Computes cost per request based on allocated pod-seconds (primary metric),
+    over/under-provisioned pod-hours, and throughput yield.
+    """
+    total_allocated_pod_seconds = 0.0
     overprovisioned_pod_seconds = 0.0
     underprovisioned_pod_seconds = 0.0
     total_reqs = 0.0
     
     for i in range(1, len(samples)):
         dt = samples[i]["time"] - samples[i-1]["time"]
-        ready_replicas = samples[i]["readyReplicas"]
+        # Use readyReplicas for active serving capacity, and desired replicas for allocated capacity
+        ready_replicas = samples[i].get("readyReplicas", 1)
+        allocated_replicas = samples[i].get("replicas", ready_replicas)
         offered_rate = samples[i]["offered_rps"]
         provisioned_cap = ready_replicas * capacity_per_pod
         
-        total_pod_seconds += ready_replicas * dt
+        total_allocated_pod_seconds += allocated_replicas * dt
         if provisioned_cap > offered_rate:
             overprovisioned_pod_seconds += (provisioned_cap - offered_rate) / capacity_per_pod * dt
         else:
@@ -112,13 +150,51 @@ def compute_cost_and_overprovisioning(samples: List[Dict[str, Any]], capacity_pe
             
         total_reqs += offered_rate * dt
         
-    cost_per_req = total_pod_seconds / max(1.0, total_reqs)
-    yield_req_per_sec = total_reqs / max(1.0, total_pod_seconds)
+    cost_per_req = total_allocated_pod_seconds / max(1.0, total_reqs)
+    yield_req_per_sec = total_reqs / max(1.0, total_allocated_pod_seconds)
     
     return {
-        "total_pod_seconds": round(total_pod_seconds, 2),
+        "total_allocated_pod_seconds": round(total_allocated_pod_seconds, 2),
         "overprovisioned_pod_hours": round(overprovisioned_pod_seconds / 3600.0, 4),
         "underprovisioned_pod_hours": round(underprovisioned_pod_seconds / 3600.0, 4),
         "cost_per_successful_request": round(cost_per_req, 4),
         "yield_requests_per_pod_second": round(yield_req_per_sec, 4),
     }
+
+def compute_smape(actual: List[float], forecast: List[float], eps: float = 1e-6) -> float:
+    """Computes sMAPE with zero handling."""
+    if len(actual) != len(forecast) or len(actual) == 0:
+        return 0.0
+    terms = []
+    for y, y_hat in zip(actual, forecast):
+        denom = (abs(y) + abs(y_hat)) / 2.0
+        if denom < eps:
+            terms.append(0.0)
+        else:
+            terms.append(abs(y - y_hat) / denom)
+    return round((sum(terms) / len(terms)) * 100.0, 2)
+
+def compute_mase(actual: List[float], forecast: List[float], history_train: List[float], m: int = 1) -> float:
+    """Computes Mean Absolute Scaled Error (MASE) relative to naive forecast."""
+    if len(actual) != len(forecast) or len(actual) == 0 or len(history_train) <= m:
+        return 0.0
+    mae = sum(abs(y - y_hat) for y, y_hat in zip(actual, forecast)) / len(actual)
+    naive_mae = sum(abs(history_train[i] - history_train[i-m]) for i in range(m, len(history_train))) / (len(history_train) - m)
+    if naive_mae < 1e-6:
+        return round(mae, 4)
+    return round(mae / naive_mae, 4)
+
+def compute_kpi1_slo_adherence(interval_metrics: List[Dict[str, Any]], slo_latency_threshold: float = 100.0, slo_error_threshold: float = 0.01) -> float:
+    """
+    Computes primary KPI-1 measure:
+    Percentage of 5-second intervals with P95 <= SLO and error rate <= 1%.
+    """
+    if not interval_metrics:
+        return 100.0
+    compliant = 0
+    for interval in interval_metrics:
+        p95 = interval.get("p95_ms", 0.0)
+        err = interval.get("error_rate", 0.0)
+        if p95 <= slo_latency_threshold and err <= slo_error_threshold:
+            compliant += 1
+    return round((compliant / len(interval_metrics)) * 100.0, 2)

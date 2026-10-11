@@ -51,23 +51,32 @@ REQUEST_LATENCY = Histogram(
 
 app = FastAPI(title="k8s-workload-app", version="0.1.0", lifespan=lifespan)
 
-def _burn_cpu(duration_ms: float) -> None:
-    deadline = time.monotonic() + duration_ms / 1000.0
+def _burn_thread_cpu(duration_ms: float) -> float:
+    """Burn fixed amount of thread CPU time using time.thread_time()."""
+    t_start = time.thread_time()
+    target_sec = duration_ms / 1000.0
     x = 1.0
-    while time.monotonic() < deadline:
+    while (time.thread_time() - t_start) < target_sec:
         x = math.sqrt(x * 1.0000001 + 0.1) * math.log1p(abs(math.sin(x)))
         if x <= 0:
             x = 1.0
+    t_burned = time.thread_time() - t_start
+    return t_burned
 
-@app.get("/work", summary="Do CPU work and return elapsed ms")
+@app.get("/work", summary="Do fixed CPU work and return elapsed time")
 def work():
-    t0 = time.monotonic()
+    t_wall_start = time.monotonic()
     try:
-        _burn_cpu(WORK_MS)
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        cpu_burned_sec = _burn_thread_cpu(WORK_MS)
+        wall_elapsed_ms = (time.monotonic() - t_wall_start) * 1000.0
         REQUEST_COUNT.labels(status="200").inc()
-        REQUEST_LATENCY.labels(status="200").observe(elapsed_ms / 1000.0)
-        return {"status": "ok", "work_ms": WORK_MS, "elapsed_ms": round(elapsed_ms, 2)}
+        REQUEST_LATENCY.labels(status="200").observe(wall_elapsed_ms / 1000.0)
+        return {
+            "status": "ok",
+            "work_ms": WORK_MS,
+            "cpu_burned_ms": round(cpu_burned_sec * 1000.0, 2),
+            "elapsed_ms": round(wall_elapsed_ms, 2)
+        }
     except Exception as exc:
         REQUEST_COUNT.labels(status="500").inc()
         raise exc

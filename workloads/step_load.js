@@ -1,12 +1,13 @@
 import http from 'k6/http';
 import { check } from 'k6';
 
-const TARGET_URL = __ENV.TARGET_URL || 'http://127.0.0.1:8080/work';
-const BASE_RATE = parseInt(__ENV.BASE_RATE || '5', 10);
-const PEAK_RATE = parseInt(__ENV.PEAK_RATE || '35', 10);
+const TARGET_URL = __ENV.TARGET_URL || 'http://workload-app.workload.svc.cluster.local:8000/work';
+const BASE_RATE = parseInt(__ENV.BASE_RATE || '4', 10);
+const PEAK_RATE = parseInt(__ENV.PEAK_RATE || '20', 10);
 
 export const options = {
   discardResponseBodies: true,
+  noConnectionReuse: true,
   scenarios: {
     step_load: {
       executor: 'ramping-arrival-rate',
@@ -23,10 +24,16 @@ export const options = {
       ],
     },
   },
+  thresholds: {
+    http_req_failed: ['rate<0.05'],
+  },
 };
 
 export default function () {
-  const res = http.get(TARGET_URL);
+  const params = {
+    timeout: '5s',
+  };
+  const res = http.get(TARGET_URL, params);
   check(res, {
     'status is 200': (r) => r.status === 200,
   });

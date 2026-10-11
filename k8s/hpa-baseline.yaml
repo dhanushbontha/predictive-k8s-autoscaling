@@ -9,7 +9,7 @@ spec:
     kind: Deployment
     name: workload-app
   minReplicas: 1
-  maxReplicas: 10
+  maxReplicas: 6
   metrics:
     - type: Resource
       resource:
@@ -25,7 +25,7 @@ spec:
           value: 100
           periodSeconds: 15
         - type: Pods
-          value: 4
+          value: 2
           periodSeconds: 15
       selectPolicy: Max
     scaleDown:
