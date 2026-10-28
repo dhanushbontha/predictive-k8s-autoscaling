@@ -24,3 +24,7 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Generated Locust results
+experiments/locust_results_*.csv
+experiments/results/
