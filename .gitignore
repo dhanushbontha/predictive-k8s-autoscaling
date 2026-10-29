@@ -31,4 +31,5 @@ experiments/metrics_*.csv
 experiments/hpa_*.csv
 experiments/predictive_*.csv
 experiments/results/
+backend/data/
 

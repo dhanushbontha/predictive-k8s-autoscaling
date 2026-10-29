@@ -1,6 +1,8 @@
 import os
 import sys
+import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,7 +15,12 @@ backend_dir = root_dir / "backend"
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-from backend.main import app
+from backend.main import (
+    app,
+    fetch_prometheus_range_metrics,
+    parse_prometheus_to_prophet_dataframe,
+    forecast_cache,
+)
 
 client = TestClient(app)
 
@@ -21,6 +28,14 @@ client = TestClient(app)
 # ---------------------------------------------------------------------------
 # Fixtures for deterministic test datasets
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def clear_cache():
+    """Ensure forecast cache is cleared before each test."""
+    forecast_cache.clear()
+    yield
+    forecast_cache.clear()
+
 
 @pytest.fixture
 def valid_forecast_csv(tmp_path):
@@ -52,7 +67,7 @@ def valid_metrics_csv(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests
+# Unit tests: Health check
 # ---------------------------------------------------------------------------
 
 def test_health_endpoint():
@@ -62,121 +77,183 @@ def test_health_endpoint():
     assert data["status"] == "ok"
     assert data["service"] == "predictive-k8s-autoscaling-backend"
     assert "version" in data
+    assert "prometheus_configured" in data
+    assert "static_fallback_enabled" in data
 
 
-def test_forecast_endpoint_valid_data(valid_forecast_csv, monkeypatch):
+# ---------------------------------------------------------------------------
+# Unit tests: Prometheus parsing and DataFrame conversion
+# ---------------------------------------------------------------------------
+
+def test_parse_prometheus_success():
+    points = [
+        (1700000000.0, 10.5),
+        (1700000005.0, 11.0),
+        (1700000010.0, 12.0),
+        (1700000015.0, 13.5),
+        (1700000020.0, 14.0),
+    ]
+    df = parse_prometheus_to_prophet_dataframe(points, min_observations=5)
+    assert len(df) == 5
+    assert list(df.columns) == ["ds", "y"]
+    assert df["ds"].dt.tz is None
+    assert df["ds"].is_monotonic_increasing
+    assert list(df["y"]) == [10.5, 11.0, 12.0, 13.5, 14.0]
+
+
+def test_parse_prometheus_insufficient_points():
+    points = [(1700000000.0, 10.5), (1700000005.0, 11.0)]
+    with pytest.raises(Exception) as excinfo:
+        parse_prometheus_to_prophet_dataframe(points, min_observations=5)
+    assert "Insufficient Prometheus observations" in str(excinfo.value.detail)
+
+
+def test_fetch_prometheus_range_metrics_parsing():
+    mock_payload = {
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {"job": "target-app-service"},
+                    "values": [
+                        [1700000000.0, "5.2"],
+                        [1700000005.0, "6.1"],
+                        [1700000010.0, "NaN"],  # Non-finite should be filtered
+                        [1700000015.0, "-1.5"], # Negative clamped to 0.0
+                    ],
+                }
+            ],
+        },
+    }
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = mock_payload
+        mock_resp.raise_for_status.return_value = None
+        mock_get.return_value = mock_resp
+
+        pts = fetch_prometheus_range_metrics("http://fake-prom:9090", "up", 100, 200)
+        assert len(pts) == 3
+        assert pts[0] == (1700000000.0, 5.2)
+        assert pts[1] == (1700000005.0, 6.1)
+        assert pts[2] == (1700000015.0, 0.0)
+
+
+def test_fetch_prometheus_timeout():
+    import requests
+    with patch("requests.get", side_effect=requests.exceptions.Timeout("Connection timed out")):
+        with pytest.raises(Exception) as excinfo:
+            fetch_prometheus_range_metrics("http://fake-prom:9090", "up", 100, 200)
+        assert excinfo.value.status_code == 502
+        assert "timed out" in excinfo.value.detail.lower()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Live Prometheus forecasting & Provenance
+# ---------------------------------------------------------------------------
+
+def test_live_prometheus_forecast_success(monkeypatch):
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
+
+    # Generate 10 mock points
+    mock_values = [[1700000000.0 + i * 5, str(10.0 + i * 0.5)] for i in range(10)]
+    mock_payload = {
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [{"metric": {}, "values": mock_values}],
+        },
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = mock_payload
+        mock_resp.raise_for_status.return_value = None
+        mock_get.return_value = mock_resp
+
+        response = client.get("/api/forecast?limit=3")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["provenance"] == "live_prometheus"
+        assert len(data["data"]) == 3
+        assert all(pt["yhat"] >= 0.0 for pt in data["data"])
+
+        # Subsequent call should hit cache
+        cache_resp = client.get("/api/predicted-load")
+        assert cache_resp.status_code == 200
+        assert cache_resp.json()["provenance"] == "live_prometheus"
+        assert cache_resp.json()["predicted_load"] >= 0.0
+
+
+def test_live_prometheus_failure_with_fallback(valid_forecast_csv, monkeypatch):
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "true")
     monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
-    response = client.get("/api/forecast")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["total_points"] == 5
-    assert len(data["data"]) == 5
-    first = data["data"][0]
-    assert first["ds"] == "2026-10-29 10:35:44.620585"
-    assert first["yhat"] == 24.2565
-    assert first["yhat_lower"] == 20.4413
-    assert first["yhat_upper"] == 28.5056
+
+    import requests
+    with patch("requests.get", side_effect=requests.exceptions.ConnectionError("Connection refused")):
+        response = client.get("/api/forecast?limit=2")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["provenance"] == "static_csv_fallback"
+        assert len(data["data"]) == 2
 
 
-def test_forecast_endpoint_with_limit(valid_forecast_csv, monkeypatch):
-    monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
-    response = client.get("/api/forecast?limit=2")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["total_points"] == 2
-    assert len(data["data"]) == 2
-    # Limit takes tail points
-    assert data["data"][-1]["yhat"] == 25.0944
+def test_live_prometheus_failure_without_fallback_raises_error(monkeypatch):
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
+
+    import requests
+    with patch("requests.get", side_effect=requests.exceptions.ConnectionError("Connection refused")):
+        response = client.get("/api/forecast")
+        assert response.status_code == 502
+        assert "failed to query prometheus" in response.json()["detail"].lower()
 
 
-def test_metrics_endpoint_valid_data(valid_forecast_csv, valid_metrics_csv, monkeypatch):
-    monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
-    monkeypatch.setenv("METRICS_CSV_PATH", valid_metrics_csv)
-    response = client.get("/api/metrics")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert "note" in data
-    # Check observed section
-    observed = data["observed"]
-    assert observed is not None
-    assert observed["timestamp_utc"] == "2026-10-29T10:35:40.000000+00:00"
-    assert observed["http_work_rps"] == 18.9
-    assert observed["pod_count"] == 2
-    # Check forecast section
-    forecast = data["forecast"]
-    assert forecast is not None
-    assert forecast["yhat"] == 25.0944
+def test_metrics_endpoint_with_live_instant_query(monkeypatch):
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
+
+    # Mock range query for forecast
+    mock_range_values = [[1700000000.0 + i * 5, str(10.0 + i)] for i in range(10)]
+    mock_instant_payload = {
+        "status": "success",
+        "data": {"resultType": "vector", "result": [{"metric": {}, "value": [1700000050.0, "15.42"]}]},
+    }
+    mock_range_payload = {
+        "status": "success",
+        "data": {"resultType": "matrix", "result": [{"metric": {}, "values": mock_range_values}]},
+    }
+
+    def mock_get_handler(url, *args, **kwargs):
+        mock_r = MagicMock()
+        mock_r.status_code = 200
+        mock_r.raise_for_status.return_value = None
+        if "query_range" in url:
+            mock_r.json.return_value = mock_range_payload
+        else:
+            mock_r.json.return_value = mock_instant_payload
+        return mock_r
+
+    with patch("requests.get", side_effect=mock_get_handler):
+        response = client.get("/api/metrics")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["provenance"] == "live_prometheus"
+        assert data["observed"]["http_work_rps"] == 15.42
+        assert data["forecast"]["provenance"] == "live_prometheus"
 
 
-def test_predicted_load_endpoint_point(valid_forecast_csv, monkeypatch):
-    monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
-    response = client.get("/api/predicted-load?horizon_steps=3&aggregation=point")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["metric_name"] == "predicted_http_work_rps"
-    assert data["unit"] == "requests_per_second"
-    assert isinstance(data["predicted_load"], float)
-    assert data["predicted_load"] >= 0.0
-    assert data["horizon_steps"] == 3
-    assert "point prediction" in data["calculation_method"]
-    assert "ready_for_keda_external_scaler" in data["keda_integration_status"]
+# ---------------------------------------------------------------------------
+# Unit tests: Cache Expiration
+# ---------------------------------------------------------------------------
 
-
-def test_predicted_load_endpoint_aggregations(valid_forecast_csv, monkeypatch):
-    monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
-
-    # Max aggregation
-    res_max = client.get("/api/predicted-load?horizon_steps=5&aggregation=max")
-    assert res_max.status_code == 200
-    assert res_max.json()["predicted_load"] == 25.0944
-
-    # Mean aggregation
-    res_mean = client.get("/api/predicted-load?horizon_steps=5&aggregation=mean")
-    assert res_mean.status_code == 200
-    expected_mean = round((24.2565 + 24.4660 + 24.6754 + 24.8849 + 25.0944) / 5, 4)
-    assert res_mean.json()["predicted_load"] == expected_mean
-
-
-def test_missing_forecast_file(tmp_path, monkeypatch):
-    non_existent = str(tmp_path / "missing_file.csv")
-    monkeypatch.setenv("FORECAST_CSV_PATH", non_existent)
-    response = client.get("/api/forecast")
-    assert response.status_code == 404
-    assert "not found" in response.json()["detail"].lower()
-
-
-def test_empty_forecast_csv(tmp_path, monkeypatch):
-    empty_file = tmp_path / "empty.csv"
-    empty_file.write_text("", encoding="utf-8")
-    monkeypatch.setenv("FORECAST_CSV_PATH", str(empty_file))
-    response = client.get("/api/forecast")
-    assert response.status_code == 422
-    assert "empty" in response.json()["detail"].lower()
-
-
-def test_missing_required_columns(tmp_path, monkeypatch):
-    bad_cols_file = tmp_path / "bad_cols.csv"
-    bad_cols_file.write_text("timestamp,value\n2026-01-01,10.0\n", encoding="utf-8")
-    monkeypatch.setenv("FORECAST_CSV_PATH", str(bad_cols_file))
-    response = client.get("/api/forecast")
-    assert response.status_code == 422
-    assert "missing required columns" in response.json()["detail"].lower()
-
-
-def test_non_numeric_forecast_values(tmp_path, monkeypatch):
-    corrupt_file = tmp_path / "corrupt.csv"
-    corrupt_file.write_text("ds,yhat\n2026-01-01 10:00:00,corrupted_value\n", encoding="utf-8")
-    monkeypatch.setenv("FORECAST_CSV_PATH", str(corrupt_file))
-    response = client.get("/api/forecast")
-    assert response.status_code == 422
-    assert "non-numeric" in response.json()["detail"].lower()
-
-
-def test_invalid_timestamps_in_forecast(tmp_path, monkeypatch):
-    bad_ts_file = tmp_path / "bad_ts.csv"
-    bad_ts_file.write_text("ds,yhat\nnot-a-timestamp,10.5\n", encoding="utf-8")
-    monkeypatch.setenv("FORECAST_CSV_PATH", str(bad_ts_file))
-    response = client.get("/api/forecast")
-    assert response.status_code == 422
-    assert "invalid timestamp" in response.json()["detail"].lower()
+def test_forecast_cache_expiration(monkeypatch):
+    forecast_cache.update(
+        df=MagicMock(), provenance="live_prometheus", source_detail="test"
+    )
+    # Set timestamp in past
+    forecast_cache.timestamp = time.time() - 40
+    assert not forecast_cache.is_valid(ttl_seconds=30)
+    assert forecast_cache.is_valid(ttl_seconds=60)

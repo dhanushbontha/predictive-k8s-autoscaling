@@ -2,226 +2,195 @@
 
 This directory contains the FastAPI backend service for **Predictive Autoscaling in Kubernetes using Load Forecasting**.
 
-The backend serves as the integration layer between offline/batch Prophet forecasting models and real-time autoscaling consumers (such as KEDA External Metric Scalers, custom controllers, or monitoring dashboards).
+The backend retrieves live application metrics from Prometheus, fits Prophet time-series models online, and provides forward-looking workload projections for proactive scaling (e.g. KEDA External Scalers).
 
 ---
 
-## 1. Architecture and Purpose
+## 1. Architecture and Data Flow
 
 ```
-+---------------------------------------+
-|  Historical Metrics & Prophet Forecasts|
-|  (experiments/*.csv, forecasting/*.csv)|
-+-------------------+-------------------+
-                    |
-                    v
-    +-------------------------------+
-    |        FastAPI Backend        |
-    |       (backend/main.py)       |
-    +---------------+---------------+
-                    |
-      +-------------+-------------+
-      |                           |
-      v                           v
-+---------------+       +-------------------+
-|  HTTP Endpoints|       | External Metrics   |
-|  /health      |       | for future KEDA    |
-|  /api/forecast|       | Scaler Integration|
-|  /api/metrics |       | (/api/predicted-  |
-+---------------+       |  load)            |
-                        +-------------------+
++--------------------------------------------------------------+
+|                Kubernetes Cluster (Minikube)                 |
+|                                                              |
+|   +---------------------+        +-----------------------+   |
+|   | Target Application  | -----> |      Prometheus       |   |
+|   |  (GET /api/work)    | metrics|  (kube-prometheus)   |   |
+|   +---------------------+        +-----------+-----------+   |
+|                                              |               |
+|                                     range    | instant       |
+|                                     queries  | queries       |
+|                                              v               |
+|                                  +-----------------------+   |
+|                                  |  Forecasting Backend  |   |
+|                                  |   (backend/main.py)   |   |
+|                                  |   - Prometheus Client |   |
+|                                  |   - Prophet Online    |   |
+|                                  |   - Model Cache (30s) |   |
+|                                  +-----------+-----------+   |
+|                                              |               |
+|                                              v               |
+|                                  +-----------------------+   |
+|                                  |  REST Endpoints       |   |
+|                                  |  - /health            |   |
+|                                  |  - /api/forecast      |   |
+|                                  |  - /api/metrics       |   |
+|                                  |  - /api/predicted-load|   |
+|                                  +-----------------------+   |
++--------------------------------------------------------------+
 ```
 
-The service exposes HTTP endpoints to:
-1. Inspect generated Prophet workload forecasts with prediction intervals.
-2. Distinguish between historical observed telemetry and forecast projections.
-3. Expose a single numeric, non-negative target metric (`predicted_http_work_rps`) designed for KEDA external metric autoscaling.
+### Provenance Tracking
+All forecast and metric responses explicitly report a `provenance` field:
+- `live_prometheus`: Model fitted dynamically on live Prometheus observations.
+- `static_csv_fallback`: Model derived from pre-generated experimental CSVs when fallback is enabled and Prometheus is unreachable.
 
 ---
 
-## 2. Installation
-
-Install backend dependencies:
-
-```powershell
-pip install -r backend/requirements.txt
-```
-
----
-
-## 3. How to Run Locally
-
-Start the backend server using Uvicorn from the repository root:
-
-```powershell
-# Default port 8080
-uvicorn backend.main:app --host 0.0.0.0 --port 8080 --reload
-```
-
-Or run directly via Python:
-
-```powershell
-python backend/main.py
-```
-
-Interactive OpenAPI documentation is available at:
-👉 **[http://localhost:8080/docs](http://localhost:8080/docs)**
-
----
-
-## 4. Environment Variables
+## 2. Environment Variables
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
-| `PORT` | `8080` | HTTP port for the FastAPI server |
-| `FORECAST_CSV_PATH` | `forecasting/forecast_periodic.csv` | Relative or absolute path to generated Prophet forecast CSV |
-| `METRICS_CSV_PATH` | `experiments/hpa_periodic.csv` | Relative or absolute path to observed experiment metrics CSV |
-| `PREDICTION_HORIZON_STEPS` | `5` | Default number of forecast steps ahead used for autoscaling |
+| `PORT` | `8080` | Port for the backend service |
+| `PROMETHEUS_URL` | `""` (local) or in cluster: `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` | Base URL of Prometheus service |
+| `TARGET_SERVICE_NAME` | `target-app-service` | Prometheus scraped job label |
+| `PROMETHEUS_QUERY` | `sum(rate(http_requests_total{job="target-app-service", handler="/api/work"}[1m]))` | PromQL query to retrieve request rate on `/api/work` |
+| `HISTORY_WINDOW_SECONDS`| `300` (5 minutes) | Lookback history window for training data |
+| `QUERY_STEP` | `5s` | Query interval step for Prometheus range queries |
+| `FORECAST_HORIZON_STEPS`| `15` | Lookahead steps to project into the future |
+| `FORECAST_CACHE_TTL_SECONDS` | `30` | In-memory cache duration to prevent retraining on every request |
+| `PREDICTION_HORIZON_STEPS` | `5` | Default steps ahead for `/api/predicted-load` |
+| `ENABLE_STATIC_FALLBACK` | `true` | When `false`, returns HTTP error if Prometheus is unreachable |
+| `FORECAST_CSV_PATH` | `/app/data/forecast_periodic.csv` | Path for static forecast fallback |
+| `METRICS_CSV_PATH` | `/app/data/hpa_periodic.csv` | Path for static metrics fallback |
 
 ---
 
-## 5. Endpoints and Example Responses
+## 3. Endpoints & Example Responses
 
 ### 1. GET `/health`
-Health check endpoint indicating service availability.
+Reports health status and whether Prometheus and static fallback are configured.
 
-**Request:**
-```http
-GET /health HTTP/1.1
-Host: localhost:8080
-```
-
-**Response (`200 OK`):**
 ```json
 {
   "status": "ok",
   "service": "predictive-k8s-autoscaling-backend",
-  "version": "1.0.0"
+  "version": "1.1.0",
+  "prometheus_configured": true,
+  "static_fallback_enabled": true
 }
 ```
-
----
 
 ### 2. GET `/api/forecast`
-Returns the generated Prophet forecast time-series points. Supports an optional `limit` query parameter.
+Generates or retrieves cached Prophet forecast points based on live Prometheus data.
 
-**Request:**
-```http
-GET /api/forecast?limit=3 HTTP/1.1
-Host: localhost:8080
-```
+**Query Parameters:**
+- `limit` (optional integer): Returns only the last $N$ points.
+- `force_refresh` (boolean, default `false`): Bypasses the cache and re-queries Prometheus.
 
-**Response (`200 OK`):**
 ```json
 {
-  "source_file": "forecast_periodic.csv",
-  "total_points": 3,
+  "provenance": "live_prometheus",
+  "source_detail": "Prometheus query on 'sum(rate(http_requests_total{job=\"target-app-service\", handler=\"/api/work\"}[1m]))' over 300s window",
+  "total_points": 2,
   "data": [
     {
-      "ds": "2026-10-29 10:35:58.620585",
-      "yhat": 25.723,
-      "yhat_lower": 20.9556,
-      "yhat_upper": 30.3445
+      "ds": "2026-10-29 18:22:22.763000011",
+      "yhat": 0.0,
+      "yhat_lower": 0.0,
+      "yhat_upper": 0.0
     },
     {
-      "ds": "2026-10-29 10:36:00.620585",
-      "yhat": 25.9325,
-      "yhat_lower": 21.3943,
-      "yhat_upper": 30.4887
-    },
-    {
-      "ds": "2026-10-29 10:36:02.620585",
-      "yhat": 26.1419,
-      "yhat_lower": 21.2527,
-      "yhat_upper": 30.7457
+      "ds": "2026-10-29 18:22:27.763000011",
+      "yhat": 0.0,
+      "yhat_lower": 0.0,
+      "yhat_upper": 0.0
     }
-  ]
+  ],
+  "generated_at_epoch": 1793298073.405
 }
 ```
 
----
-
 ### 3. GET `/api/metrics`
-Returns the latest available historical experiment snapshot alongside the latest predicted forecast value. Clearly distinguishes historical measurements from forecasted projections.
+Returns the latest instantaneous Prometheus request rate measurement alongside the latest forecast point.
 
-**Request:**
-```http
-GET /api/metrics HTTP/1.1
-Host: localhost:8080
-```
-
-**Response (`200 OK`):**
 ```json
 {
   "status": "ok",
   "observed": {
-    "timestamp_utc": "2026-10-29T10:35:32.622158+00:00",
-    "epoch_timestamp": 1793270132.622,
+    "timestamp_utc": "2026-10-29T18:21:13.421999931+00:00",
+    "epoch_timestamp": 1793298073.422,
     "collection_status": "ok",
-    "http_work_rps": 18.2341,
-    "http_rps": 19.5123,
-    "cpu_usage_cores": 0.1425,
-    "pod_count": 2,
-    "hpa_current_replicas": 2,
-    "hpa_desired_replicas": 2
+    "http_work_rps": 0.0
   },
   "forecast": {
-    "ds": "2026-10-29 10:36:02.620585",
-    "yhat": 26.1419,
-    "yhat_lower": 21.2527,
-    "yhat_upper": 30.7457
+    "ds": "2026-10-29 18:22:27.763000011",
+    "yhat": 0.0,
+    "yhat_lower": 0.0,
+    "yhat_upper": 0.0,
+    "provenance": "live_prometheus"
   },
-  "note": "Observed metrics represent historical experiment recordings; forecast values are Prophet model projections. These do not represent live real-time cluster telemetry."
+  "provenance": "live_prometheus",
+  "note": "Provenance indicates whether observed telemetry came from 'live_prometheus' or 'static_csv_fallback'."
 }
 ```
 
----
-
 ### 4. GET `/api/predicted-load`
-Returns a numeric, non-negative predicted request rate intended for future consumption by a KEDA external metric scaler.
+Returns a numeric, non-negative target metric (`predicted_http_work_rps`) designed for KEDA external autoscaling.
 
-**Query Parameters:**
-- `horizon_steps` (integer, default `5`): Lookahead horizon steps in the forecast series.
-- `aggregation` (string, default `point`):
-  - `point`: The predicted load exactly at the horizon step.
-  - `max`: The peak load across the next `horizon_steps`.
-  - `mean`: The average predicted load across the next `horizon_steps`.
-
-**Request:**
-```http
-GET /api/predicted-load?horizon_steps=5&aggregation=point HTTP/1.1
-Host: localhost:8080
-```
-
-**Response (`200 OK`):**
 ```json
 {
   "metric_name": "predicted_http_work_rps",
   "unit": "requests_per_second",
-  "predicted_load": 26.1419,
-  "target_timestamp": "2026-10-29 10:36:02.620585",
+  "predicted_load": 0.0,
+  "target_timestamp": "2026-10-29 18:22:27.763000011",
   "horizon_steps": 5,
   "calculation_method": "point prediction at horizon step 5",
+  "provenance": "live_prometheus",
   "keda_integration_status": "ready_for_keda_external_scaler"
 }
 ```
 
 ---
 
-## 6. How Predicted Load is Derived
+## 4. How to Deploy to Minikube
 
-1. **Source Data**: The endpoint accesses the predicted time-series dataframe produced by Prophet (`forecasting/forecast.py`).
-2. **Horizon Selection**: The query extracts the lookahead window (`horizon_steps`) representing projected load seconds into the future.
-3. **Aggregation Strategy**:
-   - `point`: Proactively scales to the exact future load expected $N$ steps ahead.
-   - `max`: Conservative autoscaling that provisions ahead for the worst-case peak within the horizon window to prevent SLO degradation.
-   - `mean`: Dampened autoscaling that smooths over sudden transient forecast spikes.
-4. **Boundary Checks**: All predicted values are bounded by `max(0.0, yhat)` to guarantee that autoscaling controllers never receive negative request rate targets.
+### A. Run Unit Tests
+```powershell
+python -m pytest tests/test_backend.py -v
+```
 
----
+### B. Build Docker Image
+```powershell
+docker build -t predictive-forecasting-backend:1.1 -f backend/Dockerfile backend
+```
 
-## 7. Assumptions and Limitations
+### C. Load Image into Minikube
+```powershell
+minikube image load predictive-forecasting-backend:1.1
+```
 
-- **Not Yet Integrated with KEDA**: This service provides the HTTP metric endpoint. Actual KEDA autoscaling (`ScaledObject` with `external` or `prometheus` scaler) is a subsequent milestone.
-- **Data Source**: Endpoints currently read batch/offline forecast CSV outputs. In a full production loop, this service can be paired with a continuous streaming Prometheus scraper and online model updates.
-- **Missing Data Handling**: If forecast or experiment metrics CSVs are missing or malformed, the API returns descriptive HTTP error codes (`404 Not Found` or `422 Unprocessable Entity`) instead of failing silently or fabricating false metrics.
+### D. Apply Kubernetes Manifests & Rollout
+```powershell
+kubectl apply -f kubernetes/forecasting-backend-deployment.yaml -f kubernetes/forecasting-backend-service.yaml
+kubectl rollout status deployment/forecasting-backend --timeout=90s
+```
+
+### E. Port-Forward and Verify
+In a separate terminal:
+```powershell
+kubectl port-forward svc/forecasting-backend-service 8080:8080
+```
+
+Verify endpoints:
+```powershell
+curl http://127.0.0.1:8080/health
+curl "http://127.0.0.1:8080/api/forecast?limit=2"
+curl http://127.0.0.1:8080/api/metrics
+curl http://127.0.0.1:8080/api/predicted-load
+```
+
+Verify logs confirm live Prometheus queries:
+```powershell
+kubectl logs -l app=forecasting-backend --tail=25
+```
+*(Look for `Retrieving live metrics from Prometheus...` and `Fitting Prophet model on N live Prometheus observations`)*
