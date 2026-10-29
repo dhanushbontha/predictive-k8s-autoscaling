@@ -3,12 +3,22 @@ import time
 from typing import Annotated
 
 from fastapi import FastAPI, Query
+from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(
     title="Predictive Autoscaling Target App",
     description="Target workload application for predictive Kubernetes autoscaling benchmark.",
     version="1.0.0",
 )
+
+# Instrument the app and expose the /metrics endpoint
+# Uses template routes (/api/work, /health) without URL queries to prevent label cardinality explosion
+Instrumentator(
+    should_group_status_codes=False,
+    should_ignore_untemplated=True,
+    should_respect_env_var=False,
+).instrument(app).expose(app, endpoint="/metrics", include_in_schema=True)
+
 
 
 def perform_cpu_work(iterations: int) -> float:
