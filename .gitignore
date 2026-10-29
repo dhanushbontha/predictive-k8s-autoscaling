@@ -28,4 +28,7 @@ Thumbs.db
 # Generated Locust results and metric collections
 experiments/locust_results_*.csv
 experiments/metrics_*.csv
-experiments/results/
+experiments/hpa_*.csv
+experiments/predictive_*.csv
+experiments/results/
+
