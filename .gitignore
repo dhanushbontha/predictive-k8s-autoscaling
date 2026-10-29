@@ -25,6 +25,7 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Generated Locust results
+# Generated Locust results and metric collections
 experiments/locust_results_*.csv
-experiments/results/
+experiments/metrics_*.csv
+experiments/results/
