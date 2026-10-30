@@ -1,0 +1,33 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: target-app-predictive-scaledobject
+  namespace: default
+  labels:
+    app: target-app
+    autoscaling: predictive
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: target-app
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 15
+  cooldownPeriod: 300
+  triggers:
+    - type: prometheus
+      # Metric target type:
+      # "AverageValue": Target value is per-pod (target = metricValue / currentReplicas).
+      # KEDA generates desired replicas = ceil(predicted_http_work_rps / threshold).
+      # If using "Value", the target would be evaluated as a global raw value.
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+        metricName: predicted_http_work_rps
+        query: predicted_http_work_rps
+        # PROVISIONAL THRESHOLD:
+        # 10 requests per second (RPS) per replica.
+        # NOTE: This is a provisional starting threshold based on baseline load observations
+        # and has NOT yet been experimentally validated through load testing.
+        threshold: "10"
