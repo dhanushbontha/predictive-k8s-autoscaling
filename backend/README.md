@@ -135,7 +135,7 @@ Returns the latest instantaneous Prometheus request rate measurement alongside t
 ```
 
 ### 4. GET `/api/predicted-load`
-Returns a numeric, non-negative target metric (`predicted_http_work_rps`) designed for KEDA external autoscaling.
+Returns a numeric, non-negative target metric (`predicted_http_work_rps`) designed for KEDA external autoscaling. Updates the Prometheus gauges upon calculation.
 
 ```json
 {
@@ -148,6 +148,22 @@ Returns a numeric, non-negative target metric (`predicted_http_work_rps`) design
   "provenance": "live_prometheus",
   "keda_integration_status": "ready_for_keda_external_scaler"
 }
+```
+
+### 5. GET `/metrics`
+Exposes the Prometheus metrics scrape endpoint (`text/plain; version=0.0.4`), returning the latest forecast gauges without executing expensive Prophet fitting on scrape:
+
+- `predicted_http_work_rps`: Latest predicted workload demand in requests per second.
+- `prediction_provenance`: `1.0` if generated from `live_prometheus`, `0.0` if generated from `static_csv_fallback`.
+
+**Example Scrape Output:**
+```text
+# HELP predicted_http_work_rps Latest predicted workload in requests per second for target application.
+# TYPE predicted_http_work_rps gauge
+predicted_http_work_rps 18.5234
+# HELP prediction_provenance Source of prediction: 1 for live_prometheus, 0 for static_csv_fallback.
+# TYPE prediction_provenance gauge
+prediction_provenance 1.0
 ```
 
 ---

@@ -257,3 +257,87 @@ def test_forecast_cache_expiration(monkeypatch):
     forecast_cache.timestamp = time.time() - 40
     assert not forecast_cache.is_valid(ttl_seconds=30)
     assert forecast_cache.is_valid(ttl_seconds=60)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Prometheus Gauges & /metrics endpoint
+# ---------------------------------------------------------------------------
+
+def test_metrics_endpoint_returns_prometheus_format():
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert "text/plain" in response.headers.get("content-type", "")
+    content = response.text
+    # Verify gauges exist
+    assert "predicted_http_work_rps" in content
+    assert "prediction_provenance" in content
+
+
+def test_gauges_updated_on_live_predicted_load(monkeypatch):
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
+
+    mock_values = [[1700000000.0 + i * 5, str(10.0 + i)] for i in range(10)]
+    mock_payload = {
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [{"metric": {}, "values": mock_values}],
+        },
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = mock_payload
+        mock_resp.raise_for_status.return_value = None
+        mock_get.return_value = mock_resp
+
+        # Call /api/predicted-load
+        response = client.get("/api/predicted-load?horizon_steps=3&aggregation=point")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["metric_name"] == "predicted_http_work_rps"
+        assert data["unit"] == "requests_per_second"
+        assert data["provenance"] == "live_prometheus"
+        predicted_val = data["predicted_load"]
+        assert predicted_val > 0.0
+
+        # Scrape /metrics and verify gauge values
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        content = metrics_resp.text
+        # predicted_http_work_rps should equal predicted_val
+        assert f"predicted_http_work_rps {predicted_val}" in content
+        # prediction_provenance should be 1.0 for live_prometheus
+        assert "prediction_provenance 1.0" in content
+
+
+def test_gauges_updated_on_static_fallback_predicted_load(valid_forecast_csv, monkeypatch):
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "true")
+    monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
+
+    import requests
+    with patch("requests.get", side_effect=requests.exceptions.ConnectionError("Connection refused")):
+        response = client.get("/api/predicted-load?horizon_steps=1&aggregation=point")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["provenance"] == "static_csv_fallback"
+        predicted_val = data["predicted_load"]
+
+        # Scrape /metrics and verify gauge values
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        content = metrics_resp.text
+        assert f"predicted_http_work_rps {predicted_val}" in content
+        # prediction_provenance should be 0.0 for static_csv_fallback
+        assert "prediction_provenance 0.0" in content
+
+
+def test_scraping_metrics_endpoint_does_not_call_prometheus(monkeypatch):
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    with patch("requests.get") as mock_get:
+        # Scraping /metrics should never trigger requests.get
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        mock_get.assert_not_called()

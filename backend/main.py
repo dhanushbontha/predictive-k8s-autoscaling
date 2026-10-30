@@ -17,7 +17,9 @@ import numpy as np
 import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 
 # Base repository directory
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -68,6 +70,23 @@ app = FastAPI(
     description="Live Prometheus metrics integration with Prophet load forecasting.",
     version="1.1.0",
 )
+
+# ---------------------------------------------------------------------------
+# Prometheus Metric Gauges for Autoscaling & Monitoring
+# ---------------------------------------------------------------------------
+
+PREDICTED_LOAD_GAUGE = Gauge(
+    "predicted_http_work_rps",
+    "Latest predicted workload in requests per second for target application.",
+)
+PREDICTION_PROVENANCE_GAUGE = Gauge(
+    "prediction_provenance",
+    "Source of prediction: 1 for live_prometheus, 0 for static_csv_fallback.",
+)
+
+# Safely initialize gauges with zero before the first forecast
+PREDICTED_LOAD_GAUGE.set(0.0)
+PREDICTION_PROVENANCE_GAUGE.set(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +656,11 @@ def get_predicted_load(
 
     predicted_val = max(0.0, round(predicted_val, 4))
 
+    # Update Prometheus gauges with the latest forecast and provenance
+    PREDICTED_LOAD_GAUGE.set(predicted_val)
+    provenance_val = 1.0 if provenance == "live_prometheus" else 0.0
+    PREDICTION_PROVENANCE_GAUGE.set(provenance_val)
+
     return PredictedLoadResponse(
         metric_name="predicted_http_work_rps",
         unit="requests_per_second",
@@ -647,6 +671,17 @@ def get_predicted_load(
         provenance=provenance,
         keda_integration_status="ready_for_keda_external_scaler",
     )
+
+
+@app.get("/metrics")
+def get_prometheus_metrics():
+    """
+    Exposes the most recently calculated Prometheus metrics and Gauges
+    for Prometheus scraping and KEDA predictive autoscaling.
+
+    Does not independently fit Prophet or query Prometheus; returns current state instantly.
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 if __name__ == "__main__":
