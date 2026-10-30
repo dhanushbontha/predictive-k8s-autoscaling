@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: forecasting-backend-servicemonitor
+  namespace: default
+  labels:
+    app: forecasting-backend
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: forecasting-backend
+  namespaceSelector:
+    matchNames:
+      - default
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
