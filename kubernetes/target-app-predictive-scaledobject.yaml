@@ -13,8 +13,15 @@ spec:
     name: target-app
   minReplicaCount: 1
   maxReplicaCount: 5
-  pollingInterval: 15
-  cooldownPeriod: 300
+  pollingInterval: 5
+  cooldownPeriod: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+        scaleDown:
+          stabilizationWindowSeconds: 15
   triggers:
     - type: prometheus
       # Metric target type:
