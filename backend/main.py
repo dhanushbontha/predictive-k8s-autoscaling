@@ -6,10 +6,13 @@ Integrates live Prometheus metrics with Prophet load forecasting to serve
 accurate, forward-looking workload projections for Kubernetes HPA and KEDA.
 """
 
+import asyncio
 import logging
 import math
 import os
+import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -65,10 +68,34 @@ DEFAULT_METRICS_CSV = os.getenv(
 )
 DEFAULT_PREDICTION_HORIZON_STEPS = int(os.getenv("PREDICTION_HORIZON_STEPS", "5"))
 
+# Automatic prediction refresh configuration
+REFRESH_INTERVAL_SECONDS = float(os.getenv("REFRESH_INTERVAL_SECONDS", "15.0"))
+ENABLE_AUTO_REFRESH = os.getenv("ENABLE_AUTO_REFRESH", "true").lower() in ("true", "1", "yes")
+AUTO_REFRESH_HORIZON_STEPS = int(os.getenv("AUTO_REFRESH_HORIZON_STEPS", str(DEFAULT_PREDICTION_HORIZON_STEPS)))
+AUTO_REFRESH_AGGREGATION = os.getenv("AUTO_REFRESH_AGGREGATION", "point")
+
+# Global reference for the background refresh task
+_refresh_task: Optional[asyncio.Task] = None
+
+# Thread synchronization lock for Prophet model fitting and gauge updates
+_forecast_lock = threading.RLock()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manages application startup and clean shutdown of background tasks."""
+    start_prediction_refresh_loop()
+    try:
+        yield
+    finally:
+        await stop_prediction_refresh_loop()
+
+
 app = FastAPI(
     title="Predictive Kubernetes Autoscaling API",
     description="Live Prometheus metrics integration with Prophet load forecasting.",
-    version="1.1.0",
+    version="1.2.0",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
@@ -83,10 +110,15 @@ PREDICTION_PROVENANCE_GAUGE = Gauge(
     "prediction_provenance",
     "Source of prediction: 1 for live_prometheus, 0 for static_csv_fallback.",
 )
+PREDICTION_TIMESTAMP_GAUGE = Gauge(
+    "prediction_timestamp_seconds",
+    "Unix epoch timestamp when the prediction was last successfully refreshed.",
+)
 
 # Safely initialize gauges with zero before the first forecast
 PREDICTED_LOAD_GAUGE.set(0.0)
 PREDICTION_PROVENANCE_GAUGE.set(0.0)
+PREDICTION_TIMESTAMP_GAUGE.set(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +131,9 @@ class HealthResponse(BaseModel):
     version: str
     prometheus_configured: bool
     static_fallback_enabled: bool
+    auto_refresh_enabled: bool = True
+    refresh_interval_seconds: float = 15.0
+    background_task_running: bool = False
 
 
 class ForecastItem(BaseModel):
@@ -416,59 +451,70 @@ def get_or_generate_forecast(force_refresh: bool = False) -> Tuple[pd.DataFrame,
         logger.debug("Returning cached Prophet forecast.")
         return forecast_cache.df, forecast_cache.provenance, forecast_cache.source_detail
 
-    prom_url = os.getenv("PROMETHEUS_URL", PROMETHEUS_URL)
-    prom_query = os.getenv("PROMETHEUS_QUERY", PROMETHEUS_QUERY)
-    history_sec = int(os.getenv("HISTORY_WINDOW_SECONDS", str(HISTORY_WINDOW_SECONDS)))
-    step = os.getenv("QUERY_STEP", QUERY_STEP)
-    horizon = int(os.getenv("FORECAST_HORIZON_STEPS", str(FORECAST_HORIZON_STEPS)))
-    seed = int(os.getenv("FORECAST_SEED", str(RANDOM_SEED)))
-    fallback_allowed = os.getenv("ENABLE_STATIC_FALLBACK", str(ENABLE_STATIC_FALLBACK)).lower() in ("true", "1", "yes")
+    with _forecast_lock:
+        # Re-check cache inside lock to serialize concurrent callers safely
+        if not force_refresh and forecast_cache.is_valid(ttl):
+            logger.debug("Returning freshly updated cached Prophet forecast.")
+            return forecast_cache.df, forecast_cache.provenance, forecast_cache.source_detail
 
-    # Attempt live Prometheus path if URL configured
-    if prom_url:
-        logger.info(f"Retrieving live metrics from Prometheus ({prom_url})...")
-        end_time = time.time()
-        start_time = end_time - history_sec
-        try:
-            points = fetch_prometheus_range_metrics(
-                prometheus_url=prom_url,
-                query=prom_query,
-                start_time=start_time,
-                end_time=end_time,
-                step=step,
-                timeout=float(os.getenv("PROMETHEUS_TIMEOUT_SECONDS", str(PROMETHEUS_TIMEOUT_SECONDS))),
-            )
-            df_in = parse_prometheus_to_prophet_dataframe(
-                points, min_observations=int(os.getenv("MIN_OBSERVATIONS_FOR_FIT", str(MIN_OBSERVATIONS_FOR_FIT)))
-            )
-            logger.info(f"Fitting Prophet model on {len(df_in)} live Prometheus observations...")
-            fcst_df = fit_prophet_and_forecast(df_in, horizon_steps=horizon, freq=step, seed=seed)
-            provenance = "live_prometheus"
-            detail = f"Prometheus query on '{prom_query}' over {history_sec}s window"
+        # Prevent duplicate fit if another thread completed a refresh very recently (< 1.0s)
+        if force_refresh and forecast_cache.df is not None and (time.time() - forecast_cache.timestamp) < 1.0:
+            logger.debug("Reusing forecast refreshed less than 1s ago.")
+            return forecast_cache.df, forecast_cache.provenance, forecast_cache.source_detail
+
+        prom_url = os.getenv("PROMETHEUS_URL", PROMETHEUS_URL)
+        prom_query = os.getenv("PROMETHEUS_QUERY", PROMETHEUS_QUERY)
+        history_sec = int(os.getenv("HISTORY_WINDOW_SECONDS", str(HISTORY_WINDOW_SECONDS)))
+        step = os.getenv("QUERY_STEP", QUERY_STEP)
+        horizon = int(os.getenv("FORECAST_HORIZON_STEPS", str(FORECAST_HORIZON_STEPS)))
+        seed = int(os.getenv("FORECAST_SEED", str(RANDOM_SEED)))
+        fallback_allowed = os.getenv("ENABLE_STATIC_FALLBACK", str(ENABLE_STATIC_FALLBACK)).lower() in ("true", "1", "yes")
+
+        # Attempt live Prometheus path if URL configured
+        if prom_url:
+            logger.info(f"Retrieving live metrics from Prometheus ({prom_url})...")
+            end_time = time.time()
+            start_time = end_time - history_sec
+            try:
+                points = fetch_prometheus_range_metrics(
+                    prometheus_url=prom_url,
+                    query=prom_query,
+                    start_time=start_time,
+                    end_time=end_time,
+                    step=step,
+                    timeout=float(os.getenv("PROMETHEUS_TIMEOUT_SECONDS", str(PROMETHEUS_TIMEOUT_SECONDS))),
+                )
+                df_in = parse_prometheus_to_prophet_dataframe(
+                    points, min_observations=int(os.getenv("MIN_OBSERVATIONS_FOR_FIT", str(MIN_OBSERVATIONS_FOR_FIT)))
+                )
+                logger.info(f"Fitting Prophet model on {len(df_in)} live Prometheus observations...")
+                fcst_df = fit_prophet_and_forecast(df_in, horizon_steps=horizon, freq=step, seed=seed)
+                provenance = "live_prometheus"
+                detail = f"Prometheus query on '{prom_query}' over {history_sec}s window"
+                forecast_cache.update(fcst_df, provenance, detail)
+                return fcst_df, provenance, detail
+            except HTTPException as e:
+                logger.warning(f"Live Prometheus forecasting failed: {e.detail}")
+                if not fallback_allowed:
+                    raise e
+                logger.info("Static fallback enabled; falling back to static CSV forecast.")
+
+        # Fallback to static CSV
+        if fallback_allowed:
+            fcst_df = load_static_forecast_fallback()
+            provenance = "static_csv_fallback"
+            detail = f"CSV fallback: {Path(os.getenv('FORECAST_CSV_PATH', DEFAULT_FORECAST_CSV)).name}"
             forecast_cache.update(fcst_df, provenance, detail)
             return fcst_df, provenance, detail
-        except HTTPException as e:
-            logger.warning(f"Live Prometheus forecasting failed: {e.detail}")
-            if not fallback_allowed:
-                raise e
-            logger.info("Static fallback enabled; falling back to static CSV forecast.")
 
-    # Fallback to static CSV
-    if fallback_allowed:
-        fcst_df = load_static_forecast_fallback()
-        provenance = "static_csv_fallback"
-        detail = f"CSV fallback: {Path(os.getenv('FORECAST_CSV_PATH', DEFAULT_FORECAST_CSV)).name}"
-        forecast_cache.update(fcst_df, provenance, detail)
-        return fcst_df, provenance, detail
-
-    # No Prometheus URL and no fallback allowed
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            "Prometheus is not configured (PROMETHEUS_URL empty) and "
-            "ENABLE_STATIC_FALLBACK is false. Cannot generate forecast."
-        ),
-    )
+        # No Prometheus URL and no fallback allowed
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Prometheus is not configured (PROMETHEUS_URL empty) and "
+                "ENABLE_STATIC_FALLBACK is false. Cannot generate forecast."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -480,12 +526,19 @@ def get_health():
     """Health check endpoint indicating whether the backend API is operational."""
     prom_configured = bool(os.getenv("PROMETHEUS_URL", PROMETHEUS_URL))
     fallback_enabled = os.getenv("ENABLE_STATIC_FALLBACK", str(ENABLE_STATIC_FALLBACK)).lower() in ("true", "1", "yes")
+    auto_enabled = os.getenv("ENABLE_AUTO_REFRESH", str(ENABLE_AUTO_REFRESH)).lower() in ("true", "1", "yes")
+    refresh_sec = float(os.getenv("REFRESH_INTERVAL_SECONDS", str(REFRESH_INTERVAL_SECONDS)))
+    task_running = _refresh_task is not None and not _refresh_task.done()
+
     return HealthResponse(
         status="ok",
         service="predictive-k8s-autoscaling-backend",
-        version="1.1.0",
+        version="1.2.0",
         prometheus_configured=prom_configured,
         static_fallback_enabled=fallback_enabled,
+        auto_refresh_enabled=auto_enabled,
+        refresh_interval_seconds=refresh_sec,
+        background_task_running=task_running,
     )
 
 
@@ -610,6 +663,134 @@ def get_metrics():
     )
 
 
+# ---------------------------------------------------------------------------
+# Prediction Calculation & Background Refresh Functions
+# ---------------------------------------------------------------------------
+
+def refresh_prediction(
+    horizon_steps: int = DEFAULT_PREDICTION_HORIZON_STEPS,
+    aggregation: str = "point",
+    force_refresh: bool = True,
+) -> Tuple[float, str, str, str, int]:
+    """
+    Computes predicted load for the given horizon and updates Prometheus gauges.
+    Returns (predicted_val, provenance, target_timestamp, calc_method, available_steps).
+    Raises HTTPException or requests exceptions on failure.
+    Synchronized with _forecast_lock to ensure atomic gauge updates.
+    """
+    with _forecast_lock:
+        fcst_df, provenance, _ = get_or_generate_forecast(force_refresh=force_refresh)
+
+        if len(fcst_df) == 0:
+            raise HTTPException(status_code=422, detail="Forecast series contains no predictions.")
+
+        available_steps = min(horizon_steps, len(fcst_df))
+        window_df = fcst_df.tail(available_steps)
+
+        if aggregation == "max":
+            predicted_val = float(window_df["yhat"].max())
+            target_timestamp = str(window_df.loc[window_df["yhat"].idxmax(), "ds"])
+            calc_method = f"maximum predicted load over next {available_steps} forecast steps"
+        elif aggregation == "mean":
+            predicted_val = float(window_df["yhat"].mean())
+            target_timestamp = str(window_df.iloc[-1]["ds"])
+            calc_method = f"mean predicted load over next {available_steps} forecast steps"
+        else:  # "point"
+            target_row = window_df.iloc[-1]
+            predicted_val = float(target_row["yhat"])
+            target_timestamp = str(target_row["ds"])
+            calc_method = f"point prediction at horizon step {available_steps}"
+
+        predicted_val = max(0.0, round(predicted_val, 4))
+        now_epoch = time.time()
+
+        # Update Prometheus gauges with the latest forecast, provenance, and freshness timestamp
+        PREDICTED_LOAD_GAUGE.set(predicted_val)
+        provenance_val = 1.0 if provenance == "live_prometheus" else 0.0
+        PREDICTION_PROVENANCE_GAUGE.set(provenance_val)
+        PREDICTION_TIMESTAMP_GAUGE.set(now_epoch)
+
+        return predicted_val, provenance, target_timestamp, calc_method, available_steps
+
+
+async def background_prediction_refresh_loop():
+    """
+    Periodically invokes the forecasting pipeline in a background worker to update
+    predicted_http_work_rps and prediction_provenance Prometheus gauges.
+    Survives transient errors without crashing.
+    """
+    interval = float(os.getenv("REFRESH_INTERVAL_SECONDS", str(REFRESH_INTERVAL_SECONDS)))
+    horizon = int(os.getenv("AUTO_REFRESH_HORIZON_STEPS", str(AUTO_REFRESH_HORIZON_STEPS)))
+    agg = os.getenv("AUTO_REFRESH_AGGREGATION", AUTO_REFRESH_AGGREGATION)
+    logger.info(
+        f"Starting background prediction refresh loop: interval={interval}s, "
+        f"horizon={horizon}, aggregation={agg}"
+    )
+
+    while True:
+        try:
+            # Execute synchronous Prometheus queries and Prophet fitting in a thread pool
+            predicted_val, provenance, _, _, _ = await asyncio.to_thread(
+                refresh_prediction,
+                horizon_steps=horizon,
+                aggregation=agg,
+                force_refresh=True,
+            )
+            logger.info(
+                f"Background refresh successful: predicted_load={predicted_val} RPS, "
+                f"provenance={provenance}"
+            )
+        except asyncio.CancelledError:
+            logger.info("Background prediction refresh loop cancelled.")
+            break
+        except HTTPException as e:
+            logger.warning(f"Background prediction refresh encountered HTTP error: {e.detail}")
+        except Exception as e:
+            logger.warning(f"Background prediction refresh error: {e}")
+
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info("Background prediction refresh loop cancelled during sleep.")
+            break
+
+
+def start_prediction_refresh_loop() -> Optional[asyncio.Task]:
+    """Starts the background prediction refresh loop task if not already running."""
+    global _refresh_task
+    auto_enabled = os.getenv("ENABLE_AUTO_REFRESH", str(ENABLE_AUTO_REFRESH)).lower() in ("true", "1", "yes")
+    if not auto_enabled:
+        logger.info("Background prediction refresh loop disabled (ENABLE_AUTO_REFRESH=false).")
+        return None
+
+    if _refresh_task is not None and not _refresh_task.done():
+        logger.debug("Background prediction refresh loop is already active.")
+        return _refresh_task
+
+    try:
+        loop = asyncio.get_running_loop()
+        _refresh_task = loop.create_task(background_prediction_refresh_loop())
+        logger.info("Background prediction refresh task spawned.")
+        return _refresh_task
+    except RuntimeError as e:
+        logger.warning(f"Could not start background prediction refresh loop (no running event loop): {e}")
+        return None
+
+
+async def stop_prediction_refresh_loop():
+    """Cancels and cleanly awaits the background prediction refresh task."""
+    global _refresh_task
+    if _refresh_task is not None and not _refresh_task.done():
+        logger.info("Stopping background prediction refresh task...")
+        _refresh_task.cancel()
+        try:
+            await _refresh_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Background prediction refresh task stopped.")
+    _refresh_task = None
+
+
 @app.get("/api/predicted-load", response_model=PredictedLoadResponse)
 def get_predicted_load(
     horizon_steps: int = Query(
@@ -632,34 +813,11 @@ def get_predicted_load(
     Provenance specifies whether the prediction was generated from 'live_prometheus'
     or 'static_csv_fallback'.
     """
-    fcst_df, provenance, _ = get_or_generate_forecast(force_refresh=force_refresh)
-
-    if len(fcst_df) == 0:
-        raise HTTPException(status_code=422, detail="Forecast series contains no predictions.")
-
-    available_steps = min(horizon_steps, len(fcst_df))
-    window_df = fcst_df.tail(available_steps)
-
-    if aggregation == "max":
-        predicted_val = float(window_df["yhat"].max())
-        target_timestamp = str(window_df.loc[window_df["yhat"].idxmax(), "ds"])
-        calc_method = f"maximum predicted load over next {available_steps} forecast steps"
-    elif aggregation == "mean":
-        predicted_val = float(window_df["yhat"].mean())
-        target_timestamp = str(window_df.iloc[-1]["ds"])
-        calc_method = f"mean predicted load over next {available_steps} forecast steps"
-    else:  # "point"
-        target_row = window_df.iloc[-1]
-        predicted_val = float(target_row["yhat"])
-        target_timestamp = str(target_row["ds"])
-        calc_method = f"point prediction at horizon step {available_steps}"
-
-    predicted_val = max(0.0, round(predicted_val, 4))
-
-    # Update Prometheus gauges with the latest forecast and provenance
-    PREDICTED_LOAD_GAUGE.set(predicted_val)
-    provenance_val = 1.0 if provenance == "live_prometheus" else 0.0
-    PREDICTION_PROVENANCE_GAUGE.set(provenance_val)
+    predicted_val, provenance, target_timestamp, calc_method, available_steps = refresh_prediction(
+        horizon_steps=horizon_steps,
+        aggregation=aggregation,
+        force_refresh=force_refresh,
+    )
 
     return PredictedLoadResponse(
         metric_name="predicted_http_work_rps",

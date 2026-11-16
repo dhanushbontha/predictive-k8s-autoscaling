@@ -1,8 +1,11 @@
 import os
+import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, patch
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -20,6 +23,15 @@ from backend.main import (
     fetch_prometheus_range_metrics,
     parse_prometheus_to_prophet_dataframe,
     forecast_cache,
+    refresh_prediction,
+    background_prediction_refresh_loop,
+    start_prediction_refresh_loop,
+    stop_prediction_refresh_loop,
+    lifespan,
+    _forecast_lock,
+    PREDICTED_LOAD_GAUGE,
+    PREDICTION_PROVENANCE_GAUGE,
+    PREDICTION_TIMESTAMP_GAUGE,
 )
 
 client = TestClient(app)
@@ -31,10 +43,16 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def clear_cache():
-    """Ensure forecast cache is cleared before each test."""
+    """Ensure forecast cache and gauges are cleared before each test."""
     forecast_cache.clear()
+    PREDICTED_LOAD_GAUGE.set(0.0)
+    PREDICTION_PROVENANCE_GAUGE.set(0.0)
+    PREDICTION_TIMESTAMP_GAUGE.set(0.0)
     yield
     forecast_cache.clear()
+    PREDICTED_LOAD_GAUGE.set(0.0)
+    PREDICTION_PROVENANCE_GAUGE.set(0.0)
+    PREDICTION_TIMESTAMP_GAUGE.set(0.0)
 
 
 @pytest.fixture
@@ -341,3 +359,367 @@ def test_scraping_metrics_endpoint_does_not_call_prometheus(monkeypatch):
         response = client.get("/metrics")
         assert response.status_code == 200
         mock_get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Background Refresh Loop, Lifecycle & Gauge Updates
+# ---------------------------------------------------------------------------
+
+def test_health_reports_auto_refresh_status():
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert "auto_refresh_enabled" in data
+    assert "refresh_interval_seconds" in data
+    assert "background_task_running" in data
+    assert data["version"] == "1.2.0"
+
+
+def test_refresh_prediction_updates_gauges_live():
+    mock_df = pd.DataFrame(
+        {
+            "ds": ["2026-10-29 12:00:00", "2026-10-29 12:00:05"],
+            "yhat": [15.2, 22.8],
+            "yhat_lower": [12.0, 18.0],
+            "yhat_upper": [18.0, 26.0],
+        }
+    )
+    with patch("backend.main.get_or_generate_forecast", return_value=(mock_df, "live_prometheus", "detail")):
+        val, prov, ts, method, steps = refresh_prediction(horizon_steps=2, aggregation="point", force_refresh=True)
+        assert val == 22.8
+        assert prov == "live_prometheus"
+        assert steps == 2
+        assert "point prediction" in method
+
+        # Verify gauges
+        assert PREDICTED_LOAD_GAUGE._value.get() == 22.8
+        assert PREDICTION_PROVENANCE_GAUGE._value.get() == 1.0
+
+
+def test_refresh_prediction_updates_gauges_fallback():
+    mock_df = pd.DataFrame(
+        {
+            "ds": ["2026-10-29 12:00:00"],
+            "yhat": [8.5],
+            "yhat_lower": [5.0],
+            "yhat_upper": [11.0],
+        }
+    )
+    with patch("backend.main.get_or_generate_forecast", return_value=(mock_df, "static_csv_fallback", "fallback detail")):
+        val, prov, ts, method, steps = refresh_prediction(horizon_steps=1, aggregation="point", force_refresh=True)
+        assert val == 8.5
+        assert prov == "static_csv_fallback"
+
+        # Verify gauges
+        assert PREDICTED_LOAD_GAUGE._value.get() == 8.5
+        assert PREDICTION_PROVENANCE_GAUGE._value.get() == 0.0
+
+
+def test_refresh_prediction_error_handling_no_fallback():
+    from fastapi import HTTPException
+    with patch("backend.main.get_or_generate_forecast", side_effect=HTTPException(status_code=502, detail="Prometheus unreachable")):
+        with pytest.raises(HTTPException) as excinfo:
+            refresh_prediction(force_refresh=True)
+        assert excinfo.value.status_code == 502
+        assert "Prometheus unreachable" in excinfo.value.detail
+
+
+@pytest.mark.asyncio
+async def test_background_refresh_loop_execution_and_cancellation():
+    import asyncio
+
+    call_count = 0
+
+    def mock_refresh(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        PREDICTED_LOAD_GAUGE.set(19.5)
+        PREDICTION_PROVENANCE_GAUGE.set(1.0)
+        return (19.5, "live_prometheus", "2026-01-01", "point", 5)
+
+    with patch("backend.main.refresh_prediction", side_effect=mock_refresh):
+        with patch.dict(os.environ, {"REFRESH_INTERVAL_SECONDS": "0.01"}):
+            task = asyncio.create_task(background_prediction_refresh_loop())
+            # Allow loop to execute at least one iteration
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert call_count >= 1
+    assert PREDICTED_LOAD_GAUGE._value.get() == 19.5
+    assert PREDICTION_PROVENANCE_GAUGE._value.get() == 1.0
+
+
+@pytest.mark.asyncio
+async def test_background_refresh_loop_survives_transient_errors():
+    import asyncio
+    from fastapi import HTTPException
+
+    call_count = 0
+
+    def mock_refresh_flaky(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise HTTPException(status_code=422, detail="Insufficient Prometheus observations")
+        elif call_count == 2:
+            raise ConnectionError("Prometheus connection timeout")
+        else:
+            PREDICTED_LOAD_GAUGE.set(14.0)
+            PREDICTION_PROVENANCE_GAUGE.set(1.0)
+            return (14.0, "live_prometheus", "2026-01-01", "point", 5)
+
+    with patch("backend.main.refresh_prediction", side_effect=mock_refresh_flaky):
+        with patch.dict(os.environ, {"REFRESH_INTERVAL_SECONDS": "0.01"}):
+            task = asyncio.create_task(background_prediction_refresh_loop())
+            # Allow loop to run through failures and succeed
+            await asyncio.sleep(0.08)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert call_count >= 3
+    assert PREDICTED_LOAD_GAUGE._value.get() == 14.0
+
+
+@pytest.mark.asyncio
+async def test_start_prediction_refresh_loop_singleton():
+    import asyncio
+
+    with patch("backend.main.background_prediction_refresh_loop") as mock_loop:
+        async def dummy_loop():
+            await asyncio.sleep(10)
+
+        mock_loop.side_effect = dummy_loop
+        with patch.dict(os.environ, {"ENABLE_AUTO_REFRESH": "true"}):
+            task1 = start_prediction_refresh_loop()
+            task2 = start_prediction_refresh_loop()
+            assert task1 is not None
+            assert task1 is task2  # Must be the exact same singleton task
+
+            await stop_prediction_refresh_loop()
+            assert task1.done()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_lifecycle():
+    import asyncio
+
+    with patch("backend.main.start_prediction_refresh_loop") as mock_start, \
+         patch("backend.main.stop_prediction_refresh_loop") as mock_stop:
+        mock_stop.return_value = None
+
+        async with lifespan(app):
+            mock_start.assert_called_once()
+            mock_stop.assert_not_called()
+
+        mock_stop.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Prediction Freshness, Thread Safety & KEDA Resilience
+# ---------------------------------------------------------------------------
+
+def test_prediction_timestamp_gauge_updates_on_success():
+    mock_df = pd.DataFrame(
+        {
+            "ds": ["2026-10-29 12:00:00"],
+            "yhat": [25.0],
+            "yhat_lower": [20.0],
+            "yhat_upper": [30.0],
+        }
+    )
+    with patch("backend.main.get_or_generate_forecast", return_value=(mock_df, "live_prometheus", "detail")):
+        before_time = time.time() - 0.1
+        refresh_prediction(horizon_steps=1, force_refresh=True)
+        ts = PREDICTION_TIMESTAMP_GAUGE._value.get()
+        assert ts >= before_time
+        assert ts <= time.time()
+
+        # Verify /metrics endpoint exposes the timestamp gauge
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        assert "prediction_timestamp_seconds" in resp.text
+        match = re.search(r"^prediction_timestamp_seconds\s+([0-9.e+-]+)", resp.text, re.MULTILINE)
+        assert match is not None
+        assert float(match.group(1)) == pytest.approx(ts, rel=1e-5)
+
+
+def test_prediction_timestamp_gauge_unchanged_on_failure():
+    from fastapi import HTTPException
+
+    # Set prior timestamp
+    prior_ts = 1793280000.0
+    PREDICTION_TIMESTAMP_GAUGE.set(prior_ts)
+
+    with patch("backend.main.get_or_generate_forecast", side_effect=HTTPException(status_code=502, detail="Prometheus unreachable")):
+        with pytest.raises(HTTPException):
+            refresh_prediction(force_refresh=True)
+
+        # Must not change
+        assert PREDICTION_TIMESTAMP_GAUGE._value.get() == prior_ts
+
+
+def test_freshness_gated_promql_behavior():
+    """
+    Simulates PromQL query: predicted_http_work_rps and (time() - prediction_timestamp_seconds < 45)
+    Verifies that fresh metrics pass through and stale metrics evaluate to empty/null.
+    """
+    def evaluate_freshness_gate(metric_value: float, prediction_ts: float, current_time: float, max_age: float = 45.0):
+        if (current_time - prediction_ts) < max_age:
+            return metric_value
+        return None  # Represents empty vector in PromQL
+
+    current_t = 1793280050.0
+
+    # 1. Fresh metric (10s old)
+    assert evaluate_freshness_gate(metric_value=25.0, prediction_ts=current_t - 10.0, current_time=current_t) == 25.0
+
+    # 2. Exactly boundary (44.9s old)
+    assert evaluate_freshness_gate(metric_value=25.0, prediction_ts=current_t - 44.9, current_time=current_t) == 25.0
+
+    # 3. Stale metric (50s old) -> Drops sample (empty vector)
+    assert evaluate_freshness_gate(metric_value=25.0, prediction_ts=current_t - 50.0, current_time=current_t) is None
+
+    # 4. Uninitialized gauge (ts = 0.0) -> Drops sample (empty vector)
+    assert evaluate_freshness_gate(metric_value=25.0, prediction_ts=0.0, current_time=current_t) is None
+
+
+def test_concurrent_refresh_requests_serialized():
+    """
+    Verifies that multiple concurrent calls to refresh_prediction / Prophet fitting
+    are strictly serialized by _forecast_lock and never execute concurrently.
+    """
+    import threading
+
+    in_flight = 0
+    max_concurrent = 0
+    lock = threading.Lock()
+
+    def mock_fit(df, horizon_steps=15, freq="5s", seed=42):
+        nonlocal in_flight, max_concurrent
+        with lock:
+            in_flight += 1
+            if in_flight > max_concurrent:
+                max_concurrent = in_flight
+        time.sleep(0.04)  # Simulate CPU-bound Stan model fitting
+        with lock:
+            in_flight -= 1
+
+        return pd.DataFrame({"ds": ["2026-01-01 00:00:00"], "yhat": [20.0], "yhat_lower": [15.0], "yhat_upper": [25.0]})
+
+    mock_pts = [(1700000000.0 + i * 5, 10.0) for i in range(10)]
+    with patch("backend.main.fetch_prometheus_range_metrics", return_value=mock_pts), \
+         patch("backend.main.fit_prophet_and_forecast", side_effect=mock_fit), \
+         patch.dict(os.environ, {"PROMETHEUS_URL": "http://fake-prom:9090"}):
+
+        threads = []
+        for _ in range(5):
+            t = threading.Thread(target=refresh_prediction, kwargs={"force_refresh": True})
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # Must be strictly 1 (serialized execution, zero concurrent Prophet fits)
+    assert max_concurrent == 1
+
+
+def test_keda_fallback_behavior_empty_vector_simulation():
+    """
+    Simulates KEDA 2.21.0 Prometheus Scaler handling empty vector from freshness gate:
+    - ignoreNullValues: False forces empty vector to increment failure counter.
+    - When failures reach failureThreshold (3), fallback replicas (2) are triggered.
+    - When fresh metrics resume, scaler deactivates fallback.
+    """
+    class MockKEDAPrometheusScaler:
+        def __init__(self, failure_threshold: int = 3, fallback_replicas: int = 2, threshold_rps: float = 10.0):
+            self.failure_threshold = failure_threshold
+            self.fallback_replicas = fallback_replicas
+            self.threshold_rps = threshold_rps
+            self.consecutive_failures = 0
+            self.fallback_active = False
+
+        def poll(self, query_result: Optional[float], ignore_null_values: bool = False) -> int:
+            if query_result is None:
+                if not ignore_null_values:
+                    self.consecutive_failures += 1
+                if self.consecutive_failures >= self.failure_threshold:
+                    self.fallback_active = True
+                    return self.fallback_replicas
+                return 1  # Before fallback trips, stays at current/min
+            else:
+                self.consecutive_failures = 0
+                self.fallback_active = False
+                import math
+                return max(1, min(5, math.ceil(query_result / self.threshold_rps)))
+
+    scaler = MockKEDAPrometheusScaler(failure_threshold=3, fallback_replicas=2, threshold_rps=10.0)
+
+    # Cycle 1: Fresh metric (35 RPS) -> Desired = ceil(35/10) = 4 replicas
+    assert scaler.poll(query_result=35.0, ignore_null_values=False) == 4
+    assert not scaler.fallback_active
+    assert scaler.consecutive_failures == 0
+
+    # Cycle 2: Query returns empty vector (stale data) -> Failure #1
+    assert scaler.poll(query_result=None, ignore_null_values=False) == 1
+    assert not scaler.fallback_active
+    assert scaler.consecutive_failures == 1
+
+    # Cycle 3: Query returns empty vector -> Failure #2
+    assert scaler.poll(query_result=None, ignore_null_values=False) == 1
+    assert not scaler.fallback_active
+    assert scaler.consecutive_failures == 2
+
+    # Cycle 4: Query returns empty vector -> Failure #3 -> Trips fallback!
+    assert scaler.poll(query_result=None, ignore_null_values=False) == 2
+    assert scaler.fallback_active
+    assert scaler.consecutive_failures == 3
+
+    # Cycle 5: Prometheus recovers and fresh metric returns (30 RPS) -> Trips fallback off!
+    assert scaler.poll(query_result=30.0, ignore_null_values=False) == 3
+    assert not scaler.fallback_active
+    assert scaler.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_after_prometheus_available_again():
+    """
+    Verifies that after consecutive failures, as soon as Prometheus metrics recover,
+    the background refresh loop immediately resumes updating timestamp and gauges.
+    """
+    import asyncio
+
+    attempt = 0
+    t_start = time.time()
+
+    def mock_flaky_refresh(**kwargs):
+        nonlocal attempt
+        attempt += 1
+        if attempt < 3:
+            raise ConnectionError("Prometheus down")
+        PREDICTED_LOAD_GAUGE.set(22.0)
+        PREDICTION_PROVENANCE_GAUGE.set(1.0)
+        PREDICTION_TIMESTAMP_GAUGE.set(time.time())
+        return (22.0, "live_prometheus", "2026-01-01", "point", 5)
+
+    with patch("backend.main.refresh_prediction", side_effect=mock_flaky_refresh):
+        with patch.dict(os.environ, {"REFRESH_INTERVAL_SECONDS": "0.01"}):
+            task = asyncio.create_task(background_prediction_refresh_loop())
+            await asyncio.sleep(0.08)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert attempt >= 3
+    assert PREDICTED_LOAD_GAUGE._value.get() == 22.0
+    assert PREDICTION_TIMESTAMP_GAUGE._value.get() >= t_start

@@ -1,3 +1,4 @@
+
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -15,6 +16,9 @@ spec:
   maxReplicaCount: 5
   pollingInterval: 5
   cooldownPeriod: 30
+  fallback:
+    failureThreshold: 3
+    replicas: 2
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
@@ -32,9 +36,12 @@ spec:
       metadata:
         serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
         metricName: predicted_http_work_rps
-        query: predicted_http_work_rps
+        query: max(predicted_http_work_rps) and (max(prediction_timestamp_seconds) > 0) and ((time() - max(prediction_timestamp_seconds)) < 45)
         # PROVISIONAL THRESHOLD:
         # 10 requests per second (RPS) per replica.
         # NOTE: This is a provisional starting threshold based on baseline load observations
         # and has NOT yet been experimentally validated through load testing.
         threshold: "10"
+        # Treats empty PromQL results (when predictions are stale >= 45s) as a scaler error,
+        # incrementing failure count to activate fallback replicas (2).
+        ignoreNullValues: "false"
