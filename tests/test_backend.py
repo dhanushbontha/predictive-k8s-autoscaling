@@ -723,3 +723,62 @@ async def test_recovery_after_prometheus_available_again():
     assert attempt >= 3
     assert PREDICTED_LOAD_GAUGE._value.get() == 22.0
     assert PREDICTION_TIMESTAMP_GAUGE._value.get() >= t_start
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: New Dashboard API Endpoints
+# ---------------------------------------------------------------------------
+
+def test_kubernetes_status_endpoint():
+    response = client.get("/api/kubernetes/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["deployment_name"] == "target-app"
+    assert "current_replicas" in data
+    assert "desired_replicas" in data
+    assert "cpu_usage_cores" in data
+    assert "memory_working_set_mb" in data
+    assert isinstance(data["pods"], list)
+
+
+def test_autoscaling_status_endpoint():
+    PREDICTION_TIMESTAMP_GAUGE.set(time.time())
+    PREDICTED_LOAD_GAUGE.set(18.5)
+    response = client.get("/api/autoscaling/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["scaledobject_name"] == "target-app-predictive-scaledobject"
+    assert data["metric_name"] == "predicted_http_work_rps"
+    assert data["metric_threshold"] == 10.0
+    assert data["current_predicted_load"] == 18.5
+    assert data["is_fresh"] is True
+    assert data["scaledobject_state"] == "Active"
+
+
+def test_experiment_comparison_endpoint():
+    response = client.get("/api/experiments/comparison")
+    assert response.status_code == 200
+    data = response.json()
+    assert "available_profiles" in data
+    assert set(data["available_profiles"]) == {"stable", "periodic", "gradual", "bursty", "noisy"}
+    
+    comparisons = data["comparisons"]
+    # Check that baseline HPA runs have real parsed data
+    for prof in ["stable", "periodic", "gradual", "bursty", "noisy"]:
+        assert prof in comparisons
+        hpa_data = comparisons[prof]["hpa"]
+        assert hpa_data is not None
+        assert hpa_data["total_samples"] > 0
+        assert hpa_data["duration_seconds"] > 0
+        assert hpa_data["p95_latency_ms"] >= 0
+        assert hpa_data["avg_cpu_cores"] >= 0
+
+
+def test_workload_status_and_validation():
+    status_resp = client.get("/api/workload/status")
+    assert status_resp.status_code == 200
+    assert "is_running" in status_resp.json()
+
+    # Invalid profile should return 400 Bad Request
+    start_resp = client.post("/api/workload/start", json={"profile": "invalid_profile_name"})
+    assert start_resp.status_code == 400
