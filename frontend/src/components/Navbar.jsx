@@ -12,21 +12,21 @@ export default function Navbar({
   onRefresh,
 }) {
   const titles = {
-    overview: { title: 'Overview Dashboard', desc: 'Real-time metrics, load predictions, and cluster utilization' },
-    forecasting: { title: 'Workload Forecasting', desc: 'Prophet time-series load prediction, uncertainty intervals & cache status' },
-    kubernetes: { title: 'Kubernetes Cluster & Pods', desc: 'Pod resource utilization, deployment replica states & node metrics' },
-    autoscaling: { title: 'Predictive Autoscaling (KEDA)', desc: 'ScaledObject evaluation, query freshness gate & fallback mechanics' },
-    workload: { title: 'Workload Generator', desc: 'Locust benchmark profile executor (Stable, Gradual, Bursty, Periodic, Noisy)' },
-    experiments: { title: 'Benchmark & Evaluation', desc: 'Baseline CPU HPA vs Predictive KEDA performance comparison' },
+    overview: { title: 'Overview Dashboard', desc: 'Real-time metrics, load predictions & cluster utilization' },
+    forecasting: { title: 'Workload Forecasting', desc: 'Prophet time-series load prediction & uncertainty envelope' },
+    kubernetes: { title: 'Kubernetes Cluster & Pods', desc: 'Pod resources, deployment replicas & node metrics' },
+    autoscaling: { title: 'Predictive Autoscaling (KEDA)', desc: 'ScaledObject evaluation, query freshness gate & fallback' },
+    workload: { title: 'Workload Generator', desc: 'Locust benchmark profile executor (bursty, gradual, periodic)' },
+    experiments: { title: 'Benchmark & Evaluation', desc: 'Baseline CPU HPA vs Predictive KEDA comparison' },
   };
 
   const current = titles[activeTab] || titles.overview;
 
   return (
-    <header className="h-16 bg-slate-900/80 backdrop-blur border-b border-slate-800/80 px-6 flex items-center justify-between sticky top-0 z-10">
-      <div>
+    <header className="min-h-16 py-3.5 bg-slate-900/80 backdrop-blur border-b border-slate-800/80 px-6 flex items-center justify-between sticky top-0 z-20 shrink-0">
+      <div className="min-w-0 pr-4">
         <h2 className="text-base font-semibold text-slate-100">{current.title}</h2>
-        <p className="text-xs text-slate-400 hidden sm:block">{current.desc}</p>
+        <p className="text-xs text-slate-400 hidden sm:block leading-relaxed">{current.desc}</p>
       </div>
 
       <div className="flex items-center gap-4">

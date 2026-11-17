@@ -30,6 +30,8 @@ export default function Overview({
   k8sStatus,
   autoscalingStatus,
   workloadStatus,
+  backendHealthy = true,
+  prometheusHealthy = false,
   onNavigate,
 }) {
   // Extract observed metrics from backend /api/metrics or fallback
@@ -41,14 +43,87 @@ export default function Overview({
       ? Number(observed.http_work_rps).toFixed(1)
       : '--';
 
-  // Predicted RPS from live gauge or forecast
-  const predictedRps =
-    autoscalingStatus?.current_predicted_load !== undefined &&
-    autoscalingStatus?.current_predicted_load !== null
-      ? Number(autoscalingStatus.current_predicted_load).toFixed(1)
-      : metrics?.forecast?.yhat !== undefined
-      ? Number(metrics.forecast.yhat).toFixed(1)
-      : '--';
+  const isFresh = Boolean(autoscalingStatus?.is_fresh);
+  const predictionAge = autoscalingStatus?.prediction_age_seconds;
+  const forecastStatus = autoscalingStatus?.forecast_status || (isFresh ? 'fresh' : 'waiting_for_data');
+  const activeError = forecastError || autoscalingStatus?.forecast_error;
+
+  const provenance =
+    autoscalingStatus?.current_provenance ??
+    forecastData?.provenance ??
+    metrics?.provenance ??
+    'live_prometheus';
+
+  // Determine Predicted RPS display values based on backend status and freshness
+  let predictedValue = '--';
+  let predictedUnit = 'req/s';
+  let predictedBadge = null;
+  let predictedSubtitle = null;
+  let predictedVariant = 'purple';
+
+  const isInsufficient = Boolean(
+    activeError && (activeError.toLowerCase().includes('insufficient') || activeError.toLowerCase().includes('at least 5'))
+  );
+  const isWaiting =
+    forecastStatus === 'waiting_for_data' ||
+    isInsufficient ||
+    !isFresh ||
+    predictionAge === null ||
+    autoscalingStatus?.last_prediction_timestamp === 0 ||
+    autoscalingStatus?.last_prediction_timestamp === null;
+
+  if (!backendHealthy) {
+    predictedValue = 'Offline';
+    predictedUnit = '';
+    predictedBadge = null;
+    predictedSubtitle = 'Backend service offline';
+    predictedVariant = 'amber';
+  } else if (isWaiting || isInsufficient) {
+    predictedValue = '--';
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    predictedSubtitle = (
+      <span
+        className="flex items-center gap-1.5 text-amber-400 text-xs font-medium"
+        title={activeError || 'Awaiting 5 traffic samples on /api/work'}
+      >
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 animate-pulse" />
+        <span>Waiting for live data</span>
+      </span>
+    );
+    predictedVariant = 'amber';
+  } else if (predictionAge !== null && predictionAge !== undefined && (predictionAge >= 45 || forecastStatus === 'stale')) {
+    predictedValue = '--';
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    predictedSubtitle = (
+      <span className="flex items-center gap-1.5 text-amber-400 text-xs font-medium">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+        <span>Stale (&ge;45s gate)</span>
+      </span>
+    );
+    predictedVariant = 'amber';
+  } else if (isFresh && autoscalingStatus?.current_predicted_load !== undefined && autoscalingStatus?.current_predicted_load !== null && autoscalingStatus.current_predicted_load > 0) {
+    predictedValue = Number(autoscalingStatus.current_predicted_load).toFixed(1);
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    const ageStr = predictionAge !== undefined && predictionAge !== null ? `${Math.round(predictionAge)}s ago` : 'just now';
+    predictedSubtitle = (
+      <span className="flex items-center gap-1.5 text-xs text-slate-400">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400" />
+        <span className="text-emerald-400 font-medium">Updated {ageStr}</span>
+        <span className="text-slate-600">&bull;</span>
+        <span className="font-mono text-slate-400">{provenance}</span>
+      </span>
+    );
+    predictedVariant = 'cyan';
+  } else {
+    predictedValue = '--';
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    predictedSubtitle = activeError || 'Waiting for live data';
+    predictedVariant = 'amber';
+  }
 
   // Replicas (accurately distinguishing desired from max)
   const currentReplicas =
@@ -79,14 +154,8 @@ export default function Overview({
       ? Math.round((memMb / (128 * currentReplicas)) * 100)
       : 0;
 
-  const provenance =
-    autoscalingStatus?.current_provenance ??
-    forecastData?.provenance ??
-    metrics?.provenance ??
-    'live_prometheus';
-
-  // Format forecast points for the mini-chart
-  const points = forecastData?.data || forecastData?.forecast || [];
+  // Format forecast points for the mini-chart (only show if forecast is fresh and active)
+  const points = (isFresh && forecastData) ? (forecastData?.data || forecastData?.forecast || []) : [];
   const miniChartData = points.slice(0, 30).map((pt, idx) => {
     let timeLabel = `+${idx * 15}s`;
     const tsStr = pt.ds || pt.timestamp;
@@ -103,9 +172,6 @@ export default function Overview({
       yhat_upper: Number(pt.yhat_upper || 0).toFixed(1),
     };
   });
-
-  const isFresh = autoscalingStatus?.is_fresh ?? false;
-  const predictionAge = autoscalingStatus?.prediction_age_seconds;
 
   return (
     <div className="space-y-6">
@@ -153,16 +219,12 @@ export default function Overview({
         />
         <MetricCard
           title="Predicted RPS"
-          value={predictedRps}
-          unit="req/s"
-          subtitle={
-            <span className="flex items-center gap-1">
-              Source:{' '}
-              <span className="font-mono text-cyan-400">{provenance}</span>
-            </span>
-          }
+          value={predictedValue}
+          unit={predictedUnit}
+          badge={predictedBadge}
+          subtitle={predictedSubtitle}
           icon={TrendingUp}
-          variant="purple"
+          variant={predictedVariant}
         />
         <MetricCard
           title="Current Replicas"
@@ -285,12 +347,14 @@ export default function Overview({
               </ResponsiveContainer>
             ) : (
               <div className="h-full flex flex-col items-center justify-center p-6 text-center text-xs text-slate-400 bg-slate-950/40 rounded-lg border border-dashed border-slate-800">
-                <Info className="w-8 h-8 text-cyan-400/80 mb-2" />
-                <span className="font-semibold text-slate-300 mb-1">
-                  Awaiting Application Traffic
+                <Info className="w-8 h-8 text-amber-400/90 mb-2" />
+                <span className="font-semibold text-slate-200 mb-1">
+                  {forecastStatus === 'stale'
+                    ? 'Forecast Stale (Validity Gate Closed)'
+                    : 'Awaiting Application Traffic'}
                 </span>
                 <span className="max-w-md text-slate-400 leading-relaxed">
-                  {forecastError ||
+                  {activeError ||
                     'Prometheus has not yet observed 5 consecutive /api/work requests needed to fit Prophet. Launch a profile in the Workload tab to begin real-time forecasting.'}
                 </span>
               </div>

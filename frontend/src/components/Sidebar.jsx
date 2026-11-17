@@ -29,11 +29,8 @@ export default function Sidebar({ activeTab, setActiveTab }) {
             <Layers className="w-5 h-5 text-white" />
           </div>
           <div>
-            <h1 className="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
+            <h1 className="text-sm font-bold tracking-tight text-white">
               Predictive K8s
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-mono">
-                v2.0
-              </span>
             </h1>
             <p className="text-[11px] text-slate-400 tracking-wide font-medium">
               Prophet &bull; KEDA &bull; HPA

@@ -22,6 +22,7 @@ from backend.main import (
     app,
     fetch_prometheus_range_metrics,
     parse_prometheus_to_prophet_dataframe,
+    get_or_generate_forecast,
     forecast_cache,
     refresh_prediction,
     background_prediction_refresh_loop,
@@ -29,6 +30,8 @@ from backend.main import (
     stop_prediction_refresh_loop,
     lifespan,
     _forecast_lock,
+    set_last_forecast_error,
+    get_last_forecast_error,
     PREDICTED_LOAD_GAUGE,
     PREDICTION_PROVENANCE_GAUGE,
     PREDICTION_TIMESTAMP_GAUGE,
@@ -45,11 +48,13 @@ client = TestClient(app)
 def clear_cache():
     """Ensure forecast cache and gauges are cleared before each test."""
     forecast_cache.clear()
+    set_last_forecast_error(None)
     PREDICTED_LOAD_GAUGE.set(0.0)
     PREDICTION_PROVENANCE_GAUGE.set(0.0)
     PREDICTION_TIMESTAMP_GAUGE.set(0.0)
     yield
     forecast_cache.clear()
+    set_last_forecast_error(None)
     PREDICTED_LOAD_GAUGE.set(0.0)
     PREDICTION_PROVENANCE_GAUGE.set(0.0)
     PREDICTION_TIMESTAMP_GAUGE.set(0.0)
@@ -782,3 +787,91 @@ def test_workload_status_and_validation():
     # Invalid profile should return 400 Bad Request
     start_resp = client.post("/api/workload/start", json={"profile": "invalid_profile_name"})
     assert start_resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Stale Forecast Handling & Invalidation
+# ---------------------------------------------------------------------------
+
+def test_failed_forecast_clears_cache_and_sets_error(monkeypatch):
+    """
+    Verifies that when live Prometheus returns insufficient observations (<5),
+    the forecast cache is cleared and last_forecast_error is set.
+    """
+    from fastapi import HTTPException
+    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
+    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
+
+    # Populate cache first with dummy data
+    dummy_df = pd.DataFrame({"ds": ["2026-01-01 00:00:00"], "yhat": [26.1], "yhat_lower": [20.0], "yhat_upper": [30.0]})
+    forecast_cache.update(dummy_df, "live_prometheus", "old forecast")
+    forecast_cache.timestamp = time.time() - 5.0
+    assert forecast_cache.df is not None
+
+    # Simulate 0 observations from Prometheus
+    with patch("backend.main.fetch_prometheus_range_metrics", return_value=[]):
+        with pytest.raises(HTTPException) as excinfo:
+            get_or_generate_forecast(force_refresh=True)
+
+        assert excinfo.value.status_code == 422
+        assert "insufficient prometheus observations" in excinfo.value.detail.lower()
+        # Cache must be purged
+        assert forecast_cache.df is None
+        # Error must be tracked
+        assert get_last_forecast_error() is not None
+        assert "insufficient prometheus observations" in get_last_forecast_error().lower()
+
+
+def test_autoscaling_status_exposes_forecast_error_and_waiting_status():
+    """
+    Verifies that /api/autoscaling/status reports forecast_status='waiting_for_data'
+    and includes forecast_error detail when Prometheus observations are insufficient.
+    """
+    set_last_forecast_error("Insufficient Prometheus observations: found 0, at least 5 required to fit Prophet.")
+    PREDICTION_TIMESTAMP_GAUGE.set(0.0)
+    PREDICTED_LOAD_GAUGE.set(0.0)
+
+    with patch("backend.main.get_prometheus_url", return_value=""):
+        response = client.get("/api/autoscaling/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["is_fresh"] is False
+        assert data["forecast_status"] == "waiting_for_data"
+        assert "insufficient prometheus observations" in data["forecast_error"].lower()
+
+
+def test_metrics_endpoint_withholds_stale_forecast():
+    """
+    Verifies that /api/metrics sets forecast=None when prediction is older than 45 seconds,
+    preventing stale predictions from being presented as active.
+    """
+    dummy_df = pd.DataFrame({"ds": ["2026-01-01 00:00:00"], "yhat": [26.1], "yhat_lower": [20.0], "yhat_upper": [30.0]})
+    forecast_cache.update(dummy_df, "live_prometheus", "old forecast")
+    # Simulate an expired timestamp (>45s ago)
+    PREDICTION_TIMESTAMP_GAUGE.set(time.time() - 60.0)
+
+    with patch.dict(os.environ, {"ENABLE_STATIC_FALLBACK": "false", "PROMETHEUS_URL": ""}):
+        response = client.get("/api/metrics")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["forecast"] is None
+
+
+def test_successful_forecast_restores_fresh_state():
+    """
+    Verifies that after an error or stale period, a successful prediction
+    restores is_fresh=True, forecast_status='fresh', and clears forecast_error.
+    """
+    now = time.time()
+    PREDICTION_TIMESTAMP_GAUGE.set(now)
+    PREDICTED_LOAD_GAUGE.set(32.5)
+    set_last_forecast_error(None)
+
+    with patch("backend.main.get_prometheus_url", return_value=""):
+        response = client.get("/api/autoscaling/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["is_fresh"] is True
+        assert data["forecast_status"] == "fresh"
+        assert data["forecast_error"] is None
+        assert data["current_predicted_load"] == 32.5

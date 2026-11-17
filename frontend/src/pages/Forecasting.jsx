@@ -33,16 +33,70 @@ export default function Forecasting({
   const [horizonLimit, setHorizonLimit] = useState(50);
   const [tableSearch, setTableSearch] = useState('');
 
-  const currentPredicted =
-    autoscalingStatus?.current_predicted_load !== undefined &&
-    autoscalingStatus?.current_predicted_load !== null
-      ? Number(autoscalingStatus.current_predicted_load).toFixed(2)
-      : metrics?.forecast?.yhat !== undefined
-      ? Number(metrics.forecast.yhat).toFixed(2)
-      : '--';
+  const isFresh = Boolean(autoscalingStatus?.is_fresh);
+  const ageSeconds = autoscalingStatus?.prediction_age_seconds;
+  const forecastStatus = autoscalingStatus?.forecast_status || (isFresh ? 'fresh' : 'waiting_for_data');
+  const activeError = forecastError || autoscalingStatus?.forecast_error;
 
-  const historyPoints = forecastData?.history || [];
-  const forecastPoints = forecastData?.data || forecastData?.forecast || [];
+  // Determine currentPredicted presentation
+  let predictedDisplay = '--';
+  let predictedUnit = 'req/s';
+  let predictedBadge = null;
+  let predictedSubtitle = 'Served to KEDA ScaledObject';
+  let predictedVariant = 'cyan';
+
+  const isInsufficient = Boolean(
+    activeError && (activeError.toLowerCase().includes('insufficient') || activeError.toLowerCase().includes('at least 5'))
+  );
+  const isWaiting =
+    forecastStatus === 'waiting_for_data' ||
+    isInsufficient ||
+    !isFresh ||
+    ageSeconds === null ||
+    autoscalingStatus?.last_prediction_timestamp === 0 ||
+    autoscalingStatus?.last_prediction_timestamp === null;
+
+  if (isWaiting || isInsufficient) {
+    predictedDisplay = '--';
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    predictedSubtitle = (
+      <span
+        className="flex items-center gap-1.5 text-amber-400 text-xs font-medium"
+        title={activeError || 'Awaiting 5 traffic samples on /api/work'}
+      >
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 animate-pulse" />
+        <span>Waiting for live data</span>
+      </span>
+    );
+    predictedVariant = 'amber';
+  } else if (ageSeconds !== null && ageSeconds !== undefined && (ageSeconds >= 45 || forecastStatus === 'stale')) {
+    predictedDisplay = '--';
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    predictedSubtitle = (
+      <span className="flex items-center gap-1.5 text-amber-400 text-xs font-medium">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+        <span>Stale (&ge;45s gate)</span>
+      </span>
+    );
+    predictedVariant = 'amber';
+  } else if (isFresh && autoscalingStatus?.current_predicted_load !== undefined && autoscalingStatus?.current_predicted_load !== null && autoscalingStatus.current_predicted_load > 0) {
+    predictedDisplay = Number(autoscalingStatus.current_predicted_load).toFixed(2);
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    predictedSubtitle = `Fresh prediction (${Math.round(ageSeconds || 0)}s old)`;
+    predictedVariant = 'cyan';
+  } else {
+    predictedDisplay = '--';
+    predictedUnit = 'req/s';
+    predictedBadge = null;
+    predictedSubtitle = activeError || 'Waiting for live data';
+    predictedVariant = 'amber';
+  }
+
+  const historyPoints = (isFresh || forecastData) ? (forecastData?.history || []) : [];
+  const forecastPoints = (isFresh && forecastData) ? (forecastData?.data || forecastData?.forecast || []) : [];
   const displayForecastPoints = forecastPoints.slice(0, horizonLimit);
 
   // Compute max / min bounds from display points
@@ -101,9 +155,6 @@ export default function Forecasting({
     ? new Date(generatedEpoch * 1000).toLocaleTimeString()
     : 'N/A';
 
-  const isFresh = autoscalingStatus?.is_fresh ?? false;
-  const ageSeconds = autoscalingStatus?.prediction_age_seconds;
-
   return (
     <div className="space-y-6">
       {/* Top Controls & Status Header */}
@@ -118,11 +169,27 @@ export default function Forecasting({
                 Prophet Workload Forecasting Engine
               </h2>
               <StatusBadge
-                status={forecastData?.provenance || 'live_prometheus'}
-                label={forecastData?.provenance || 'Live Prometheus'}
+                status={
+                  forecastStatus === 'fresh'
+                    ? 'healthy'
+                    : forecastStatus === 'waiting_for_data'
+                    ? 'warning'
+                    : forecastStatus === 'stale'
+                    ? 'warning'
+                    : 'error'
+                }
+                label={
+                  forecastStatus === 'fresh'
+                    ? 'Fresh Forecast'
+                    : forecastStatus === 'waiting_for_data'
+                    ? 'Waiting for Live Data'
+                    : forecastStatus === 'stale'
+                    ? 'Stale (>45s Gate Closed)'
+                    : 'Forecast Error'
+                }
               />
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                Generated: {generatedTimeStr}
+                Generated: {isFresh ? generatedTimeStr : 'Pending live data'}
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-0.5">
@@ -143,15 +210,41 @@ export default function Forecasting({
         </div>
       </div>
 
+      {/* Warning/Error Banner when waiting for live observations or model fitting error */}
+      {(!isFresh || activeError) && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex items-start gap-3">
+          <div className="p-2 rounded-lg bg-amber-500/20 text-amber-400 shrink-0 mt-0.5">
+            <Info className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <div className="text-sm font-semibold text-amber-200">
+              {forecastStatus === 'waiting_for_data'
+                ? 'Forecasting Standby: Awaiting Live Prometheus Traffic Observations'
+                : forecastStatus === 'stale'
+                ? 'Forecast Validity Expired (>45s): KEDA Fallback Safeguard Triggered'
+                : 'Forecast Refresh Notice'}
+            </div>
+            <div className="text-xs text-slate-300 leading-relaxed">
+              {activeError ||
+                'Prophet requires at least 5 consecutive request-rate observations on /api/work to train the time-series model. When observations are insufficient, old predictions are withheld to protect autoscaling integrity.'}
+            </div>
+            <div className="text-[11px] text-slate-400">
+              Tip: Go to the <span className="text-cyan-400 font-medium">Workload Generator</span> tab and start a traffic profile to generate live application metrics.
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard
           title="Current Predicted RPS"
-          value={currentPredicted}
-          unit="req/s"
-          subtitle="Served to KEDA ScaledObject"
+          value={predictedDisplay}
+          unit={predictedUnit}
+          badge={predictedBadge}
+          subtitle={predictedSubtitle}
           icon={TrendingUp}
-          variant="cyan"
+          variant={predictedVariant}
         />
         <MetricCard
           title="Prediction Freshness"
@@ -214,7 +307,7 @@ export default function Forecasting({
         </div>
 
         <div className="h-80 w-full">
-          {chartData.length > 0 ? (
+          {chartData.length > 0 && isFresh ? (
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 20 }}>
                 <defs>
@@ -329,16 +422,18 @@ export default function Forecasting({
             </ResponsiveContainer>
           ) : (
             <div className="h-full flex flex-col items-center justify-center p-8 text-center text-xs text-slate-400 bg-slate-950/40 rounded-xl border border-dashed border-slate-800">
-              <Info className="w-10 h-10 text-cyan-400/80 mb-3" />
+              <Info className="w-10 h-10 text-amber-400/90 mb-3" />
               <h4 className="text-sm font-semibold text-slate-200 mb-1">
-                Forecast Projections Not Yet Available
+                {forecastStatus === 'stale'
+                  ? 'Forecast Stale (Validity Gate Closed)'
+                  : 'Forecast Projections Awaiting Traffic'}
               </h4>
               <p className="max-w-md text-slate-400 leading-relaxed mb-4">
-                {forecastError ||
+                {activeError ||
                   'The forecasting backend requires at least 5 consecutive live Prometheus traffic observations on target-app (/api/work) before fitting a Prophet time-series model.'}
               </p>
               <div className="flex items-center gap-2 text-[11px] text-slate-400">
-                <span>Tip: Go to the <strong>Workload Generator</strong> tab and launch any profile to generate live traffic.</span>
+                <span>Tip: Go to the <strong className="text-cyan-400">Workload Generator</strong> tab and launch any profile to generate live traffic.</span>
               </div>
             </div>
           )}

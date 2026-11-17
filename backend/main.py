@@ -97,6 +97,21 @@ _refresh_task: Optional[asyncio.Task] = None
 # Thread synchronization lock for Prophet model fitting and gauge updates
 _forecast_lock = threading.RLock()
 
+# Last forecast error message (thread-safe)
+_last_forecast_error: Optional[str] = None
+_last_forecast_error_lock = threading.Lock()
+
+
+def set_last_forecast_error(err: Optional[str]):
+    global _last_forecast_error
+    with _last_forecast_error_lock:
+        _last_forecast_error = err
+
+
+def get_last_forecast_error() -> Optional[str]:
+    with _last_forecast_error_lock:
+        return _last_forecast_error
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -163,6 +178,8 @@ class HealthResponse(BaseModel):
     background_task_running: bool = False
     last_prediction_timestamp: Optional[float] = None
     prediction_age_seconds: Optional[float] = None
+    is_fresh: bool = False
+    last_forecast_error: Optional[str] = None
 
 
 class HistoricalItem(BaseModel):
@@ -537,11 +554,24 @@ def get_or_generate_forecast(force_refresh: bool = False) -> Tuple[pd.DataFrame,
                 provenance = "live_prometheus"
                 detail = f"Prometheus query on '{prom_query}' over {history_sec}s window"
                 forecast_cache.update(fcst_df, provenance, detail, history_df=df_in)
+                set_last_forecast_error(None)
                 return fcst_df, provenance, detail
             except HTTPException as e:
+                set_last_forecast_error(e.detail)
+                if force_refresh:
+                    forecast_cache.clear()
                 logger.warning(f"Live Prometheus forecasting failed: {e.detail}")
                 if not fallback_allowed:
                     raise e
+                logger.info("Static fallback enabled; falling back to static CSV forecast.")
+            except Exception as e:
+                err_msg = str(e)
+                set_last_forecast_error(err_msg)
+                if force_refresh:
+                    forecast_cache.clear()
+                logger.warning(f"Live Prometheus forecasting failed with error: {err_msg}")
+                if not fallback_allowed:
+                    raise HTTPException(status_code=500, detail=f"Forecasting error: {err_msg}") from e
                 logger.info("Static fallback enabled; falling back to static CSV forecast.")
 
         # Fallback to static CSV
@@ -553,12 +583,16 @@ def get_or_generate_forecast(force_refresh: bool = False) -> Tuple[pd.DataFrame,
             return fcst_df, provenance, detail
 
         # No Prometheus URL and no fallback allowed
+        err_detail = (
+            "Prometheus is not configured (PROMETHEUS_URL empty) and "
+            "ENABLE_STATIC_FALLBACK is false. Cannot generate forecast."
+        )
+        set_last_forecast_error(err_detail)
+        if force_refresh:
+            forecast_cache.clear()
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Prometheus is not configured (PROMETHEUS_URL empty) and "
-                "ENABLE_STATIC_FALLBACK is false. Cannot generate forecast."
-            ),
+            detail=err_detail,
         )
 
 
@@ -586,6 +620,7 @@ def get_health():
     last_ts = PREDICTION_TIMESTAMP_GAUGE._value.get()
     now = time.time()
     age = max(0.0, round(now - last_ts, 1)) if last_ts > 0 else None
+    is_fresh = bool(age is not None and age < 45.0)
 
     return HealthResponse(
         status="ok",
@@ -599,6 +634,8 @@ def get_health():
         background_task_running=task_running,
         last_prediction_timestamp=round(last_ts, 2) if last_ts > 0 else None,
         prediction_age_seconds=age,
+        is_fresh=is_fresh,
+        last_forecast_error=get_last_forecast_error(),
     )
 
 
@@ -711,19 +748,32 @@ def get_metrics():
         except Exception as e:
             logger.warning(f"Could not load fallback metrics CSV: {e}")
 
-    # Load latest forecast prediction
+    # Load latest forecast prediction only if valid, cached, and fresh (<45s)
     try:
         fcst_df, fcst_prov, _ = get_or_generate_forecast(force_refresh=False)
-        latest_f = fcst_df.iloc[-1]
-        forecast_obj = ForecastSummary(
-            ds=str(latest_f["ds"]),
-            yhat=round(float(latest_f["yhat"]), 4),
-            yhat_lower=round(float(latest_f["yhat_lower"]), 4) if pd.notnull(latest_f.get("yhat_lower")) else None,
-            yhat_upper=round(float(latest_f["yhat_upper"]), 4) if pd.notnull(latest_f.get("yhat_upper")) else None,
-            provenance=fcst_prov,
-        )
+        last_pred_ts = PREDICTION_TIMESTAMP_GAUGE._value.get()
+        cache_ts = forecast_cache.timestamp
+        if last_pred_ts > 0:
+            is_pred_fresh = (time.time() - last_pred_ts) < 45.0
+        elif cache_ts > 0:
+            is_pred_fresh = (time.time() - cache_ts) < 45.0
+        else:
+            is_pred_fresh = False
+
+        if is_pred_fresh and fcst_df is not None and not fcst_df.empty:
+            latest_f = fcst_df.iloc[-1]
+            forecast_obj = ForecastSummary(
+                ds=str(latest_f["ds"]),
+                yhat=round(float(latest_f["yhat"]), 4),
+                yhat_lower=round(float(latest_f["yhat_lower"]), 4) if pd.notnull(latest_f.get("yhat_lower")) else None,
+                yhat_upper=round(float(latest_f["yhat_upper"]), 4) if pd.notnull(latest_f.get("yhat_upper")) else None,
+                provenance=fcst_prov,
+            )
+        else:
+            forecast_obj = None
     except Exception as e:
         logger.warning(f"Forecast unavailable for /api/metrics: {e}")
+        forecast_obj = None
 
     if observed_obj is None and forecast_obj is None:
         if not fallback_allowed and not prom_url:
@@ -767,7 +817,15 @@ def refresh_prediction(
     Synchronized with _forecast_lock to ensure atomic gauge updates.
     """
     with _forecast_lock:
-        fcst_df, provenance, _ = get_or_generate_forecast(force_refresh=force_refresh)
+        try:
+            fcst_df, provenance, _ = get_or_generate_forecast(force_refresh=force_refresh)
+            set_last_forecast_error(None)
+        except HTTPException as e:
+            set_last_forecast_error(e.detail)
+            raise
+        except Exception as e:
+            set_last_forecast_error(str(e))
+            raise
 
         if len(fcst_df) == 0:
             raise HTTPException(status_code=422, detail="Forecast series contains no predictions.")
@@ -986,6 +1044,8 @@ class AutoscalingStatusResponse(BaseModel):
     scaledobject_state: str = "Active"
     ready_status: bool = True
     active_status: bool = True
+    forecast_status: str = "waiting_for_data"
+    forecast_error: Optional[str] = None
     last_scale_event: Optional[str] = None
 
 
@@ -1296,9 +1356,14 @@ def get_autoscaling_status():
     prov_val = PREDICTION_PROVENANCE_GAUGE._value.get()
     current_prov = "live_prometheus" if prov_val == 1.0 else "static_csv_fallback"
 
-    # If backend gauges are at 0 (e.g. backend just started), try reading from Prometheus
+    current_error = get_last_forecast_error()
+    is_insufficient = current_error is not None and (
+        "insufficient" in current_error.lower() or "at least 5" in current_error.lower()
+    )
+
+    # If backend gauges are at 0 and NO forecast error has occurred, try reading from Prometheus
     prom_url = get_prometheus_url()
-    if last_ts == 0.0 and prom_url:
+    if last_ts == 0.0 and not current_error and prom_url:
         try:
             r = requests.get(f"{prom_url}/api/v1/query", params={"query": "max(prediction_timestamp_seconds)"}, timeout=2.0)
             if r.status_code == 200:
@@ -1316,7 +1381,26 @@ def get_autoscaling_status():
 
     now = time.time()
     age = max(0.0, round(now - last_ts, 1)) if last_ts > 0 else 9999.0
-    is_fresh = (age < 45.0) and (last_ts > 0)
+
+    # Determine forecast freshness / availability status consistently
+    if current_error or is_insufficient:
+        err_lower = (current_error or "").lower()
+        if "insufficient" in err_lower or "at least 5" in err_lower or last_ts == 0.0:
+            fcst_status = "waiting_for_data"
+        else:
+            fcst_status = "error"
+        is_fresh = False
+        current_load = 0.0
+    elif last_ts == 0.0:
+        fcst_status = "waiting_for_data"
+        is_fresh = False
+        current_load = 0.0
+    elif age >= 45.0:
+        fcst_status = "stale"
+        is_fresh = False
+    else:
+        fcst_status = "fresh"
+        is_fresh = True
 
     # Determine KEDA status conditions
     if live_keda:
@@ -1326,24 +1410,20 @@ def get_autoscaling_status():
         hpa_name = live_keda["hpa_name"]
         if fallback_active:
             state = "Fallback"
-        elif active_status:
+        elif active_status and is_fresh:
             state = "Active"
         else:
             state = "Inactive"
     else:
         ready_status = True
-        if last_ts == 0.0:
-            state = "Inactive"
+        if not is_fresh or fcst_status == "waiting_for_data":
+            state = "Fallback" if (last_ts > 0 and age >= 45.0) else "Inactive"
             active_status = False
-            fallback_active = False
-        elif is_fresh:
+            fallback_active = (last_ts > 0 and age >= 45.0)
+        else:
             state = "Active"
             active_status = True
             fallback_active = False
-        else:
-            state = "Fallback"
-            active_status = False
-            fallback_active = True
         hpa_name = manifest_cfg.get("hpa_name", "keda-hpa-target-app-predictive-scaledobject")
 
     threshold = manifest_cfg.get("threshold", 10.0)
@@ -1373,6 +1453,8 @@ def get_autoscaling_status():
         scaledobject_state=state,
         ready_status=ready_status,
         active_status=active_status,
+        forecast_status=fcst_status,
+        forecast_error=current_error,
         last_scale_event=f"Evaluated {current_load:.1f} RPS -> desired: {calculated_desired} replica(s)",
     )
 

@@ -27,7 +27,65 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
       ? Math.round(autoscalingStatus.prediction_age_seconds)
       : null;
 
-  const isGateValid = autoscalingStatus?.is_fresh ?? (freshnessAge !== null && freshnessAge < 45);
+  const isGateValid = Boolean(autoscalingStatus?.is_fresh);
+  const activeError = autoscalingStatus?.forecast_error;
+  const forecastStatus = autoscalingStatus?.forecast_status || (isGateValid ? 'fresh' : 'waiting_for_data');
+
+  let metricValueDisplay = currentVal;
+  let metricUnitDisplay = 'req/s';
+  let metricBadge = null;
+  let metricSubtitle = 'Queried live by KEDA scaler';
+  let metricVariant = 'cyan';
+
+  const isInsufficient = Boolean(
+    activeError && (activeError.toLowerCase().includes('insufficient') || activeError.toLowerCase().includes('at least 5'))
+  );
+  const isWaiting =
+    forecastStatus === 'waiting_for_data' ||
+    isInsufficient ||
+    !isGateValid ||
+    freshnessAge === null ||
+    autoscalingStatus?.last_prediction_timestamp === 0 ||
+    autoscalingStatus?.last_prediction_timestamp === null;
+
+  if (isWaiting || isInsufficient) {
+    metricValueDisplay = '--';
+    metricUnitDisplay = 'req/s';
+    metricBadge = null;
+    metricSubtitle = (
+      <span
+        className="flex items-center gap-1.5 text-amber-400 text-xs font-medium"
+        title={activeError || 'Awaiting 5 traffic samples on /api/work'}
+      >
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 animate-pulse" />
+        <span>Waiting for live data</span>
+      </span>
+    );
+    metricVariant = 'amber';
+  } else if (freshnessAge !== null && freshnessAge !== undefined && (freshnessAge >= 45 || forecastStatus === 'stale')) {
+    metricValueDisplay = '--';
+    metricUnitDisplay = 'req/s';
+    metricBadge = null;
+    metricSubtitle = (
+      <span className="flex items-center gap-1.5 text-amber-400 text-xs font-medium">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+        <span>Stale (&ge;45s gate closed)</span>
+      </span>
+    );
+    metricVariant = 'amber';
+  } else if (isGateValid && currentVal !== '--' && Number(currentVal) > 0) {
+    metricValueDisplay = currentVal;
+    metricUnitDisplay = 'req/s';
+    metricBadge = null;
+    metricSubtitle = `Active query &bull; Refreshed ${freshnessAge}s ago`;
+    metricVariant = 'cyan';
+  } else {
+    metricValueDisplay = '--';
+    metricUnitDisplay = 'req/s';
+    metricBadge = null;
+    metricSubtitle = activeError || 'Waiting for live data';
+    metricVariant = 'amber';
+  }
 
   const readyStatus = autoscalingStatus?.ready_status ?? true;
   const activeStatus = autoscalingStatus?.active_status ?? isGateValid;
@@ -100,11 +158,12 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard
           title="Predicted RPS Metric"
-          value={currentVal}
-          unit="req/s"
-          subtitle="Queried live by KEDA scaler"
+          value={metricValueDisplay}
+          unit={metricUnitDisplay}
+          badge={metricBadge}
+          subtitle={metricSubtitle}
           icon={Gauge}
-          variant="cyan"
+          variant={metricVariant}
         />
         <MetricCard
           title="Scaler Target Threshold"

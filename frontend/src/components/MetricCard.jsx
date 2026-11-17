@@ -55,22 +55,25 @@ export default function MetricCard({
 
   return (
     <div
-      className={`relative bg-slate-900/60 backdrop-blur-sm border ${style.border} rounded-xl p-5 transition-all duration-300 hover:shadow-lg hover:shadow-black/40 overflow-hidden group`}
+      className={`relative bg-slate-900/60 backdrop-blur-sm border ${style.border} rounded-xl p-4 sm:p-5 transition-all duration-300 hover:shadow-lg hover:shadow-black/40 overflow-hidden group`}
     >
       {/* Subtle background glow */}
       <div
         className={`absolute inset-0 bg-gradient-to-br ${style.glow} opacity-50 pointer-events-none`}
       />
 
-      <div className="relative z-10 flex items-start justify-between mb-3">
-        <span className="text-xs font-medium uppercase tracking-wider text-slate-400">
-          {title}
-        </span>
+      <div className="relative z-10 flex items-start justify-between gap-2 mb-3">
+        <div className="flex flex-col min-w-0 flex-1">
+          <span className="text-xs font-medium uppercase tracking-normal text-slate-400 leading-snug">
+            {title}
+          </span>
+          {badge && <div className="mt-1">{badge}</div>}
+        </div>
         {Icon && (
           <div
-            className={`p-2.5 rounded-lg border ${style.iconBg} flex items-center justify-center transition-transform group-hover:scale-105 duration-200`}
+            className={`p-2 rounded-lg border ${style.iconBg} flex items-center justify-center transition-transform group-hover:scale-105 duration-200 shrink-0 ml-1`}
           >
-            <Icon className="w-5 h-5" />
+            <Icon className="w-4 h-4" />
           </div>
         )}
       </div>
@@ -80,11 +83,10 @@ export default function MetricCard({
           {value !== undefined && value !== null ? value : '--'}
         </span>
         {unit && <span className="text-sm font-semibold text-slate-400">{unit}</span>}
-        {badge && <div className="ml-auto">{badge}</div>}
       </div>
 
       {subtitle && (
-        <div className="relative z-10 mt-2 text-xs text-slate-400 flex items-center gap-1.5">
+        <div className="relative z-10 mt-2 text-xs text-slate-400 flex items-center gap-1.5 leading-normal">
           {subtitle}
         </div>
       )}

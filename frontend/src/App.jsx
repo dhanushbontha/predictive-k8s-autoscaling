@@ -43,13 +43,21 @@ export default function App() {
 
       if (!isMountedRef.current) return;
 
-      // Backend health is verified directly by /health response
+      // Backend health: verified if /health or any core API endpoint returns data
       if (healthRes.status === 'fulfilled' && healthRes.value?.status === 'ok') {
         setHealth(healthRes.value);
         setBackendHealthy(true);
         setPrometheusHealthy(Boolean(healthRes.value?.prometheus_connected));
-      } else if (metricsRes.status === 'fulfilled' || k8sRes.status === 'fulfilled') {
+      } else if (
+        metricsRes.status === 'fulfilled' ||
+        k8sRes.status === 'fulfilled' ||
+        autoRes.status === 'fulfilled'
+      ) {
         setBackendHealthy(true);
+        if (healthRes.status === 'fulfilled') {
+          setHealth(healthRes.value);
+          setPrometheusHealthy(Boolean(healthRes.value?.prometheus_connected));
+        }
       } else {
         setBackendHealthy(false);
       }
@@ -67,6 +75,14 @@ export default function App() {
 
       if (autoRes.status === 'fulfilled') {
         setAutoscalingStatus(autoRes.value);
+        if (autoRes.value?.forecast_status === 'waiting_for_data') {
+          setForecastData(null);
+          if (autoRes.value?.forecast_error) {
+            setForecastError(autoRes.value.forecast_error);
+          }
+        } else if (autoRes.value?.forecast_error && !autoRes.value?.is_fresh) {
+          setForecastError(autoRes.value.forecast_error);
+        }
       }
 
       if (workloadRes.status === 'fulfilled') {
@@ -93,6 +109,7 @@ export default function App() {
         err.response?.data?.detail ||
         err.message ||
         'Forecast unavailable (insufficient traffic observations)';
+      setForecastData(null);
       setForecastError(detail);
     }
   }, []);
