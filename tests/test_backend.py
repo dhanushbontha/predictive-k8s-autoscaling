@@ -761,17 +761,27 @@ def test_autoscaling_status_endpoint():
 
 
 def test_experiment_comparison_endpoint():
+    # 1. Default clean research comparison (experiments/results/)
     response = client.get("/api/experiments/comparison")
     assert response.status_code == 200
     data = response.json()
     assert "available_profiles" in data
     assert set(data["available_profiles"]) == {"stable", "periodic", "gradual", "bursty", "noisy"}
-    
+
+    # Initially before new runs, experiments/results/ is empty, so comparisons are clean / awaiting data
     comparisons = data["comparisons"]
-    # Check that baseline HPA runs have real parsed data
     for prof in ["stable", "periodic", "gradual", "bursty", "noisy"]:
         assert prof in comparisons
-        hpa_data = comparisons[prof]["hpa"]
+        assert comparisons[prof]["profile"] == prof
+
+    # 2. Historical backup source (experiments/)
+    hist_response = client.get("/api/experiments/comparison?source=historical")
+    assert hist_response.status_code == 200
+    hist_data = hist_response.json()
+    hist_comparisons = hist_data["comparisons"]
+    for prof in ["stable", "periodic", "gradual", "bursty", "noisy"]:
+        assert prof in hist_comparisons
+        hpa_data = hist_comparisons[prof]["hpa"]
         assert hpa_data is not None
         assert hpa_data["total_samples"] > 0
         assert hpa_data["duration_seconds"] > 0
@@ -875,3 +885,78 @@ def test_successful_forecast_restores_fresh_state():
         assert data["forecast_status"] == "fresh"
         assert data["forecast_error"] is None
         assert data["current_predicted_load"] == 32.5
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: CPU HPA & Multi-Pattern Benchmark Metrics
+# ---------------------------------------------------------------------------
+
+def test_cpu_hpa_status_endpoint():
+    """
+    Verifies that /api/hpa/status returns valid HPA configuration,
+    manifest baseline settings, and active controller status.
+    """
+    response = client.get("/api/hpa/status")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["hpa_name"] == "target-app-hpa"
+    assert data["target_cpu_utilization_percent"] == 50
+    assert data["min_replicas"] == 1
+    assert data["max_replicas"] == 5
+    assert "active_controller" in data
+    assert "config" in data
+    assert data["config"]["target_cpu_utilization_percent"] == 50
+    assert data["config"]["min_replicas"] == 1
+    assert data["config"]["max_replicas"] == 5
+    assert isinstance(data["conditions"], list)
+    assert isinstance(data["scaling_events"], list)
+
+
+def test_autoscaling_status_active_controller():
+    """
+    Verifies that /api/autoscaling/status reports controller ownership,
+    conditions list, and scaling events without mislabeling.
+    """
+    response = client.get("/api/autoscaling/status")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert "active_controller" in data
+    assert data["active_controller"] in ("keda", "cpu-hpa", "none")
+    assert "active_controller_name" in data
+    assert "conditions" in data
+    assert isinstance(data["conditions"], list)
+    assert "scaling_events" in data
+    assert isinstance(data["scaling_events"], list)
+
+
+def test_experiments_comparison_metrics_fields():
+    """
+    Verifies that /api/experiments/comparison supports all 5 workload patterns
+    and returns comprehensive metrics including error rates, CPU%, MAE, and RMSE.
+    """
+    response = client.get("/api/experiments/comparison")
+    assert response.status_code == 200
+    data = response.json()
+
+    expected_profiles = ["stable", "periodic", "gradual", "bursty", "noisy"]
+    for prof in expected_profiles:
+        assert prof in data["available_profiles"]
+        assert prof in data["comparisons"]
+        comp = data["comparisons"][prof]
+        assert "hpa" in comp
+        assert "predictive" in comp
+
+        # Check fields on available benchmark metrics
+        for mode in ("hpa", "predictive"):
+            metrics = comp[mode]
+            if metrics is not None:
+                assert "p95_latency_ms" in metrics
+                assert "p99_latency_ms" in metrics
+                assert "avg_cpu_percent" in metrics
+                assert "error_count" in metrics
+                assert "error_rate_pct" in metrics
+                assert "mae" in metrics
+                assert "rmse" in metrics
+

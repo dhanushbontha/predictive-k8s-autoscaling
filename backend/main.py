@@ -1020,6 +1020,53 @@ class KubernetesStatusResponse(BaseModel):
     pods: List[PodInfo] = Field(default_factory=list)
 
 
+class HpaCondition(BaseModel):
+    type: str
+    status: str
+    reason: Optional[str] = None
+    message: Optional[str] = None
+    last_transition_time: Optional[str] = None
+
+
+class HpaScalingEvent(BaseModel):
+    timestamp: Optional[str] = None
+    type: str = "Normal"
+    reason: str
+    message: str
+    object: Optional[str] = None
+
+
+class CpuHpaConfig(BaseModel):
+    name: str = "target-app-hpa"
+    namespace: str = "default"
+    target_deployment: str = "target-app"
+    min_replicas: int = 1
+    max_replicas: int = 5
+    target_cpu_utilization_percent: int = 50
+    scale_up_stabilization_seconds: int = 0
+    scale_down_stabilization_seconds: int = 15
+    scale_up_policies: List[Dict[str, Any]] = Field(default_factory=list)
+    scale_down_policies: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class CpuHpaStatusResponse(BaseModel):
+    is_applied: bool
+    is_active_controller: bool
+    active_controller: str = "none"
+    active_controller_name: str
+    hpa_name: str = "target-app-hpa"
+    target_deployment: str = "target-app"
+    current_cpu_utilization_percent: Optional[float] = None
+    target_cpu_utilization_percent: int = 50
+    current_replicas: int = 1
+    desired_replicas: int = 1
+    min_replicas: int = 1
+    max_replicas: int = 5
+    conditions: List[HpaCondition] = Field(default_factory=list)
+    scaling_events: List[HpaScalingEvent] = Field(default_factory=list)
+    config: CpuHpaConfig
+
+
 class AutoscalingStatusResponse(BaseModel):
     scaledobject_name: str = "target-app-predictive-scaledobject"
     hpa_name: str = "keda-hpa-target-app-predictive-scaledobject"
@@ -1047,6 +1094,10 @@ class AutoscalingStatusResponse(BaseModel):
     forecast_status: str = "waiting_for_data"
     forecast_error: Optional[str] = None
     last_scale_event: Optional[str] = None
+    active_controller: str = "keda"
+    active_controller_name: str = "KEDA Predictive Autoscaler (target-app-predictive-scaledobject)"
+    conditions: List[HpaCondition] = Field(default_factory=list)
+    scaling_events: List[HpaScalingEvent] = Field(default_factory=list)
 
 
 class WorkloadStartRequest(BaseModel):
@@ -1065,6 +1116,7 @@ class WorkloadStatusResponse(BaseModel):
     duration_seconds: Optional[int] = None
     user_count: Optional[int] = None
     target_url: str = "http://127.0.0.1:8000"
+    target_host: Optional[str] = None
 
 
 class ProfileMetrics(BaseModel):
@@ -1076,6 +1128,7 @@ class ProfileMetrics(BaseModel):
     p99_latency_ms: float
     avg_cpu_cores: float
     max_cpu_cores: float
+    avg_cpu_percent: Optional[float] = None
     avg_memory_mb: float
     avg_replicas: float
     max_replicas: float
@@ -1084,6 +1137,10 @@ class ProfileMetrics(BaseModel):
     slo_violations_count: int = 0
     slo_violation_duration_seconds: float = 0.0
     total_core_seconds: float = 0.0
+    error_count: int = 0
+    error_rate_pct: float = 0.0
+    mae: Optional[float] = None
+    rmse: Optional[float] = None
     has_data: bool = True
 
 
@@ -1180,6 +1237,108 @@ def get_keda_scaledobject_live_status():
     except Exception:
         pass
     return None
+
+
+def get_cpu_hpa_manifest_config() -> CpuHpaConfig:
+    """Parses traditional CPU HPA configuration from kubernetes/target-app-hpa.yaml."""
+    manifest_path = BASE_DIR / "kubernetes" / "target-app-hpa.yaml"
+    cfg = CpuHpaConfig()
+    if manifest_path.is_file():
+        try:
+            import yaml
+            doc = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+            if doc and isinstance(doc, dict):
+                spec = doc.get("spec", {})
+                cfg.name = doc.get("metadata", {}).get("name", cfg.name)
+                cfg.target_deployment = spec.get("scaleTargetRef", {}).get("name", cfg.target_deployment)
+                cfg.min_replicas = int(spec.get("minReplicas", cfg.min_replicas))
+                cfg.max_replicas = int(spec.get("maxReplicas", cfg.max_replicas))
+                metrics = spec.get("metrics", [])
+                if metrics and isinstance(metrics[0], dict):
+                    res = metrics[0].get("resource", {})
+                    cfg.target_cpu_utilization_percent = int(res.get("target", {}).get("averageUtilization", cfg.target_cpu_utilization_percent))
+                behavior = spec.get("behavior", {})
+                scale_up = behavior.get("scaleUp", {})
+                cfg.scale_up_stabilization_seconds = int(scale_up.get("stabilizationWindowSeconds", cfg.scale_up_stabilization_seconds))
+                cfg.scale_up_policies = scale_up.get("policies", [])
+                scale_down = behavior.get("scaleDown", {})
+                cfg.scale_down_stabilization_seconds = int(scale_down.get("stabilizationWindowSeconds", cfg.scale_down_stabilization_seconds))
+                cfg.scale_down_policies = scale_down.get("policies", [])
+        except Exception as e:
+            logger.warning(f"Error reading CPU HPA manifest: {e}")
+    return cfg
+
+
+def get_kubernetes_scaling_events(object_filter: str = "") -> List[HpaScalingEvent]:
+    """Retrieves actual Kubernetes scaling and metric events from the cluster."""
+    events = []
+    try:
+        res = subprocess.run(
+            ["kubectl", "get", "events", "-n", "default", "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        if res.returncode == 0:
+            import json
+            data = json.loads(res.stdout)
+            for item in data.get("items", []):
+                obj = item.get("involvedObject", {})
+                name = obj.get("name", "")
+                kind = obj.get("kind", "")
+                if object_filter:
+                    if object_filter.lower() not in name.lower() and object_filter.lower() not in kind.lower():
+                        continue
+                ts = item.get("lastTimestamp") or item.get("eventTime") or item.get("firstTimestamp")
+                events.append(
+                    HpaScalingEvent(
+                        timestamp=ts,
+                        type=item.get("type", "Normal"),
+                        reason=item.get("reason", "Unknown"),
+                        message=item.get("message", ""),
+                        object=f"{kind}/{name}",
+                    )
+                )
+    except Exception:
+        pass
+    return events[:15]
+
+
+def get_active_autoscaler_controller() -> Tuple[str, str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Determines which autoscaler controller currently governs Deployment/target-app.
+    Returns: (controller_key, controller_name, keda_hpa_json, cpu_hpa_json)
+    """
+    keda_hpa = None
+    cpu_hpa = None
+    try:
+        res = subprocess.run(
+            ["kubectl", "get", "hpa", "-n", "default", "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        if res.returncode == 0:
+            import json
+            data = json.loads(res.stdout)
+            for item in data.get("items", []):
+                hpa_name = item.get("metadata", {}).get("name", "")
+                target_ref = item.get("spec", {}).get("scaleTargetRef", {}).get("name", "")
+                if target_ref == "target-app":
+                    if "keda" in hpa_name.lower():
+                        keda_hpa = item
+                    elif "target-app-hpa" in hpa_name.lower():
+                        cpu_hpa = item
+    except Exception:
+        pass
+
+    if keda_hpa and cpu_hpa:
+        return "conflict", "Dual Controller Conflict (both KEDA and CPU HPA targeting target-app)", keda_hpa, cpu_hpa
+    elif keda_hpa:
+        return "keda", "KEDA Predictive Autoscaler (keda-hpa-target-app-predictive-scaledobject)", keda_hpa, cpu_hpa
+    elif cpu_hpa:
+        return "cpu-hpa", "Traditional CPU HPA (target-app-hpa)", keda_hpa, cpu_hpa
+    return "keda", "KEDA Predictive Autoscaler (Configured Controller)", keda_hpa, cpu_hpa
 
 
 # ---------------------------------------------------------------------------
@@ -1429,6 +1588,24 @@ def get_autoscaling_status():
     threshold = manifest_cfg.get("threshold", 10.0)
     calculated_desired = max(1, min(manifest_cfg.get("max_replicas", 5), math.ceil(current_load / threshold)))
 
+    ctrl_key, ctrl_name, keda_hpa, cpu_hpa = get_active_autoscaler_controller()
+    keda_conditions = []
+    if keda_hpa:
+        for c in keda_hpa.get("status", {}).get("conditions", []):
+            keda_conditions.append(
+                HpaCondition(
+                    type=c.get("type", ""),
+                    status=c.get("status", "Unknown"),
+                    reason=c.get("reason"),
+                    message=c.get("message"),
+                    last_transition_time=c.get("lastTransitionTime"),
+                )
+            )
+
+    keda_events = get_kubernetes_scaling_events(object_filter="scaledobject")
+    if not keda_events:
+        keda_events = get_kubernetes_scaling_events(object_filter="keda")
+
     return AutoscalingStatusResponse(
         scaledobject_name=manifest_cfg.get("name", "target-app-predictive-scaledobject"),
         hpa_name=hpa_name,
@@ -1456,6 +1633,119 @@ def get_autoscaling_status():
         forecast_status=fcst_status,
         forecast_error=current_error,
         last_scale_event=f"Evaluated {current_load:.1f} RPS -> desired: {calculated_desired} replica(s)",
+        active_controller=ctrl_key,
+        active_controller_name=ctrl_name,
+        conditions=keda_conditions,
+        scaling_events=keda_events,
+    )
+
+
+@app.get("/api/hpa/status", response_model=CpuHpaStatusResponse)
+def get_cpu_hpa_status():
+    """
+    Returns real-time status of the traditional Kubernetes CPU-Based HPA.
+    Distinguishes whether it is currently active or in standby relative to KEDA.
+    """
+    config = get_cpu_hpa_manifest_config()
+    ctrl_key, ctrl_name, keda_hpa, cpu_hpa = get_active_autoscaler_controller()
+
+    is_applied = cpu_hpa is not None
+    is_active_ctrl = (ctrl_key == "cpu-hpa")
+
+    curr_reps = 1
+    desired_reps = 1
+    cpu_util_pct = None
+    conditions = []
+
+    if cpu_hpa:
+        status = cpu_hpa.get("status", {})
+        curr_reps = status.get("currentReplicas", 1)
+        desired_reps = status.get("desiredReplicas", curr_reps)
+        raw_conds = status.get("conditions", [])
+        for c in raw_conds:
+            conditions.append(
+                HpaCondition(
+                    type=c.get("type", ""),
+                    status=c.get("status", "Unknown"),
+                    reason=c.get("reason"),
+                    message=c.get("message"),
+                    last_transition_time=c.get("lastTransitionTime"),
+                )
+            )
+        for m in status.get("currentMetrics", []):
+            if m.get("type") == "Resource" and m.get("resource", {}).get("name") == "cpu":
+                cur_res = m.get("resource", {}).get("current", {})
+                if "averageUtilization" in cur_res:
+                    cpu_util_pct = float(cur_res["averageUtilization"])
+    else:
+        # If target-app-hpa is not applied in cluster, query live Prometheus for target-app CPU usage
+        prom_url = get_prometheus_url()
+        if prom_url:
+            try:
+                r_cpu = requests.get(
+                    f"{prom_url}/api/v1/query",
+                    params={"query": 'sum(node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate{namespace="default", pod=~"target-app-.*"})'},
+                    timeout=2.0
+                )
+                if r_cpu.status_code == 200:
+                    res_cpu = r_cpu.json().get("data", {}).get("result", [])
+                    if res_cpu and "value" in res_cpu[0]:
+                        cpu_cores = float(res_cpu[0]["value"][1])
+                        # Query pod count
+                        r_pods = requests.get(
+                            f"{prom_url}/api/v1/query",
+                            params={"query": 'count(kube_pod_status_phase{namespace="default", pod=~"target-app-.*", phase="Running"})'},
+                            timeout=2.0
+                        )
+                        if r_pods.status_code == 200:
+                            p_res = r_pods.json().get("data", {}).get("result", [])
+                            if p_res and "value" in p_res[0]:
+                                curr_reps = max(1, int(float(p_res[0]["value"][1])))
+                        # Calculate CPU% relative to 100m (0.1 core) request per pod
+                        requested_cores = curr_reps * 0.1
+                        cpu_util_pct = round((cpu_cores / max(0.01, requested_cores)) * 100.0, 1)
+            except Exception:
+                pass
+
+        conditions = [
+            HpaCondition(
+                type="AbleToScale",
+                status="True" if is_applied else "False",
+                reason="ControllerStandby" if not is_applied else "ReadyForNewScale",
+                message="Target-app is currently controlled by KEDA Predictive Autoscaler. CPU HPA is configured in manifest as baseline comparison." if not is_applied else "HPA is active and ready to scale",
+            ),
+            HpaCondition(
+                type="ScalingActive",
+                status="True" if is_applied else "False",
+                reason="ValidMetricFound" if is_applied else "ControllerStandby",
+                message="CPU utilization metric monitoring active" if is_applied else "Standby: not scaling target deployment while KEDA is active",
+            ),
+            HpaCondition(
+                type="ScalingLimited",
+                status="False",
+                reason="DesiredWithinRange",
+                message="The desired replica count is within configured min/max boundaries",
+            ),
+        ]
+
+    scaling_events = get_kubernetes_scaling_events(object_filter="target-app")
+
+    return CpuHpaStatusResponse(
+        is_applied=is_applied,
+        is_active_controller=is_active_ctrl,
+        active_controller=ctrl_key,
+        active_controller_name=ctrl_name,
+        hpa_name=config.name,
+        target_deployment=config.target_deployment,
+        current_cpu_utilization_percent=cpu_util_pct,
+        target_cpu_utilization_percent=config.target_cpu_utilization_percent,
+        current_replicas=curr_reps,
+        desired_replicas=desired_reps,
+        min_replicas=config.min_replicas,
+        max_replicas=config.max_replicas,
+        conditions=conditions,
+        scaling_events=scaling_events,
+        config=config,
     )
 
 
@@ -1510,6 +1800,38 @@ def _analyze_csv_dataset(csv_path: Path, profile_name: str) -> Optional[ProfileM
         slo_count = int(slo_info.get("latency_violations_count", 0))
         slo_dur = float(slo_info.get("latency_violation_duration_seconds", 0.0))
 
+        # Error count and rate
+        err_rps = pd.to_numeric(df.get("http_error_rps", 0), errors="coerce").fillna(0)
+        work_rps = pd.to_numeric(df.get("http_work_rps", 0), errors="coerce").fillna(0)
+        total_errs = int(err_rps.sum())
+        err_rate = float((err_rps.sum() / max(1e-3, err_rps.sum() + work_rps.sum())) * 100.0)
+
+        # Average CPU utilization percentage based on 100m (0.1 core) request per pod
+        avg_cpu_percent = round((avg_cpu / max(0.01, avg_pods * 0.1)) * 100.0, 1)
+
+        # Calculate authentic MAE and RMSE from held-out test evaluation if forecast file exists
+        mae_val = None
+        rmse_val = None
+        fcst_path = BASE_DIR / "backend" / "data" / f"forecast_{profile_name}.csv"
+        if not fcst_path.is_file():
+            fcst_path = BASE_DIR / "forecasting" / f"forecast_{profile_name}.csv"
+        if fcst_path.is_file() and "http_work_rps" in df.columns:
+            try:
+                from forecasting.evaluate_forecast import evaluate_forecast_performance, align_actual_and_predicted
+                test_df = df.copy()
+                test_df["ds"] = pd.to_datetime(test_df["timestamp_utc"]).dt.tz_localize(None)
+                test_df["y"] = test_df["http_work_rps"].fillna(0)
+                fcst_df = pd.read_csv(fcst_path)
+                fcst_df["ds"] = pd.to_datetime(fcst_df["ds"]).dt.tz_localize(None)
+                aligned = align_actual_and_predicted(test_df, fcst_df)
+                clean = aligned.dropna(subset=["y", "yhat"])
+                if len(clean) > 0:
+                    eval_res = evaluate_forecast_performance(clean["y"].values, clean["yhat"].values)
+                    mae_val = round(eval_res["mae"], 2)
+                    rmse_val = round(eval_res["rmse"], 2)
+            except Exception as e:
+                logger.warning(f"Error computing MAE/RMSE for {profile_name}: {e}")
+
         return ProfileMetrics(
             profile=profile_name,
             total_samples=len(df),
@@ -1519,6 +1841,7 @@ def _analyze_csv_dataset(csv_path: Path, profile_name: str) -> Optional[ProfileM
             p99_latency_ms=round(p99, 1),
             avg_cpu_cores=round(avg_cpu, 4),
             max_cpu_cores=round(max_cpu, 4),
+            avg_cpu_percent=avg_cpu_percent,
             avg_memory_mb=round(avg_mem, 1),
             avg_replicas=round(avg_pods, 2),
             max_replicas=round(max_pods, 1),
@@ -1527,6 +1850,10 @@ def _analyze_csv_dataset(csv_path: Path, profile_name: str) -> Optional[ProfileM
             slo_violations_count=slo_count,
             slo_violation_duration_seconds=round(slo_dur, 1),
             total_core_seconds=round(core_seconds, 1),
+            error_count=total_errs,
+            error_rate_pct=round(err_rate, 2),
+            mae=mae_val,
+            rmse=rmse_val,
             has_data=True,
         )
     except Exception as e:
@@ -1535,12 +1862,20 @@ def _analyze_csv_dataset(csv_path: Path, profile_name: str) -> Optional[ProfileM
 
 
 @app.get("/api/experiments/comparison", response_model=ExperimentComparisonResponse)
-def get_experiment_comparison():
+def get_experiment_comparison(
+    source: str = Query("results", description="Dataset source directory: 'results' (default: experiments/results) or 'historical' (experiments/)")
+):
     """
     Returns authentic side-by-side performance metrics for HPA vs Predictive KEDA
     across all five experimental workload profiles.
+    By default queries clean experiments/results/ directory to start with a clean research comparison.
     """
-    exp_dir = BASE_DIR / "experiments"
+    if source.lower() == "historical":
+        exp_dir = BASE_DIR / "experiments"
+    else:
+        exp_dir = BASE_DIR / "experiments" / "results"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+
     comparisons = {}
 
     for profile, desc in PROFILES_METADATA.items():
@@ -1591,6 +1926,13 @@ def get_workload_status():
         else:
             _workload_process = None
 
+    target_url = os.getenv("TARGET_APP_URL")
+    if not target_url:
+        if os.getenv("KUBERNETES_SERVICE_HOST"):
+            target_url = "http://target-app-service.default.svc.cluster.local:8000"
+        else:
+            target_url = "http://127.0.0.1:8000"
+
     return WorkloadStatusResponse(
         is_running=is_running,
         active_profile=_workload_meta.get("profile") if is_running else None,
@@ -1599,7 +1941,8 @@ def get_workload_status():
         elapsed_seconds=elapsed,
         duration_seconds=_workload_meta.get("duration"),
         user_count=_workload_meta.get("user_count"),
-        target_url=os.getenv("TARGET_APP_URL", "http://127.0.0.1:8000"),
+        target_url=target_url,
+        target_host=target_url,
     )
 
 
@@ -1628,13 +1971,20 @@ def start_workload(req: WorkloadStartRequest):
     if not locustfile.is_file():
         raise HTTPException(status_code=500, detail="locustfile.py not found in experiments directory.")
 
+    target_url = os.getenv("TARGET_APP_URL")
+    if not target_url:
+        if os.getenv("KUBERNETES_SERVICE_HOST"):
+            target_url = "http://target-app-service.default.svc.cluster.local:8000"
+        else:
+            target_url = "http://127.0.0.1:8000"
+
     env = os.environ.copy()
     env["WORKLOAD_PROFILE"] = req.profile.lower()
     env["EXPERIMENT_DURATION"] = str(req.duration)
     env["USER_COUNT"] = str(req.user_count)
     env["SPAWN_RATE"] = str(req.spawn_rate)
-    target_url = os.getenv("TARGET_APP_URL", "http://127.0.0.1:8000")
     env["TARGET_APP_URL"] = target_url
+    env["TARGET_BASE_URL"] = target_url
 
     cmd = [
         sys.executable,

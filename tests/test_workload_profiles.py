@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from pathlib import Path
 import pytest
 
@@ -8,7 +9,7 @@ workspace_root = Path(__file__).resolve().parent.parent
 if str(workspace_root) not in sys.path:
     sys.path.insert(0, str(workspace_root))
 
-from experiments.locustfile import WorkloadShapeConfig, TargetAppUser
+from experiments.locustfile import WorkloadShapeConfig, TargetAppUser, WorkloadMetricsTracker
 
 
 def test_default_configuration():
@@ -82,6 +83,26 @@ def test_profile_c_gradual():
         assert cfg.calculate_tick(101.0) is None
 
 
+def test_profile_c_gradual_smooth():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("WORKLOAD_PROFILE", "gradual")
+        mp.setenv("GRADUAL_MODE", "smooth")
+        mp.setenv("EXPERIMENT_DURATION", "100")
+        mp.setenv("LOW_USERS", "2")
+        mp.setenv("HIGH_USERS", "12")
+
+        cfg = WorkloadShapeConfig()
+        assert cfg.gradual_smooth is True
+        # At start (t=0): 2 users
+        assert cfg.calculate_tick(0.0)[0] == 2
+        # At halfway (t=50): 2 + 0.5 * 10 = 7 users
+        assert cfg.calculate_tick(50.0)[0] == 7
+        # Near end (t=100): 12 users
+        assert cfg.calculate_tick(100.0)[0] == 12
+        # Terminated at 101s
+        assert cfg.calculate_tick(101.0) is None
+
+
 def test_profile_d_bursty():
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("WORKLOAD_PROFILE", "bursty")
@@ -123,6 +144,59 @@ def test_profile_e_noisy_seed_reproducibility():
         ticks1 = [cfg1.calculate_tick(t)[0] for t in [0.0, 5.0, 10.0, 15.0, 20.0]]
         ticks3 = [cfg3.calculate_tick(t)[0] for t in [0.0, 5.0, 10.0, 15.0, 20.0]]
         assert ticks1 != ticks3
+
+
+def test_all_five_profiles_termination():
+    profiles = ["stable", "periodic", "gradual", "bursty", "noisy"]
+    duration = 50
+    for p in profiles:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("WORKLOAD_PROFILE", p)
+            mp.setenv("EXPERIMENT_DURATION", str(duration))
+            cfg = WorkloadShapeConfig()
+            # Under duration -> returns tuple (users, spawn_rate)
+            tick_valid = cfg.calculate_tick(duration - 1.0)
+            assert tick_valid is not None
+            assert isinstance(tick_valid[0], int)
+            assert tick_valid[0] >= 1
+            # Over duration -> must return None to stop test
+            assert cfg.calculate_tick(duration + 0.1) is None
+
+
+def test_legacy_environment_variable_support():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("LOW_USERS", raising=False)
+        mp.delenv("HIGH_USERS", raising=False)
+        mp.setenv("LOW_LOAD_USERS", "4")
+        mp.setenv("HIGH_LOAD_USERS", "16")
+        cfg = WorkloadShapeConfig()
+        assert cfg.low_users == 4
+        assert cfg.high_users == 16
+
+
+def test_workload_metrics_tracker_achieved_rps():
+    tracker = WorkloadMetricsTracker()
+    assert tracker.total_requests == 0
+    assert tracker.get_achieved_rps() == 0.0
+
+    # Simulate 10 successful requests and 2 failures over 2 seconds
+    t0 = 1000.0
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(time, "time", lambda: t0)
+        tracker.record_request(success=True)
+
+        mp.setattr(time, "time", lambda: t0 + 1.0)
+        for _ in range(9):
+            tracker.record_request(success=True)
+        for _ in range(2):
+            tracker.record_request(success=False)
+
+        summary = tracker.get_summary()
+        assert summary["total_requests"] == 12
+        assert summary["successful_requests"] == 10
+        assert summary["failed_requests"] == 2
+        assert summary["elapsed_seconds"] == 1.0
+        assert summary["achieved_rps"] == 12.0
 
 
 def test_target_app_user_tasks():
