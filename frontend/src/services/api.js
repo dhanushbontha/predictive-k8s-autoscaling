@@ -53,6 +53,11 @@ export const api = {
     return res.data;
   },
 
+  getCpuHpaStatus: async () => {
+    const res = await client.get('/api/hpa/status');
+    return res.data;
+  },
+
   // Workload Generator Controls
   getWorkloadStatus: async () => {
     const res = await client.get('/api/workload/status');
@@ -75,8 +80,8 @@ export const api = {
   },
 
   // Experiment Comparison
-  getExperimentComparison: async () => {
-    const res = await client.get('/api/experiments/comparison');
+  getExperimentComparison: async (source = 'results') => {
+    const res = await client.get(`/api/experiments/comparison?source=${encodeURIComponent(source)}`);
     return res.data;
   },
 };

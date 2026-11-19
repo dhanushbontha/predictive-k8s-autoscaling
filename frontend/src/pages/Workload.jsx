@@ -140,9 +140,12 @@ export default function Workload({
                 />
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Target Host:{' '}
-                <span className="font-mono text-slate-300">
-                  {workloadStatus?.target_host || 'http://target-app.default.svc.cluster.local:8080'}
+                Target URL:{' '}
+                <span className="font-mono text-cyan-400 font-semibold">
+                  {workloadStatus?.target_url || workloadStatus?.target_host || 'http://127.0.0.1:8000'}
+                </span>
+                <span className="text-slate-400 ml-2">
+                  &bull; K8s Service: <span className="font-mono text-slate-300">target-app-service:8000 (HTTP)</span>
                 </span>
                 {isRunning && workloadStatus?.pid && (
                   <span className="ml-2">
@@ -327,12 +330,13 @@ export default function Workload({
         </div>
       </div>
 
-      {/* Safety & Isolation Information */}
-      <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800/80 flex items-start gap-3">
-        <ShieldAlert className="w-5 h-5 text-cyan-400 flex-shrink-0 mt-0.5" />
-        <div className="text-xs text-slate-400 leading-relaxed">
-          <strong className="text-slate-200">Safe Execution Guarantee:</strong> The dashboard communicates exclusively through validated FastAPI backend endpoints. Locust processes run in headless background mode with bounded duration and user limits. Raw terminal commands are never executed directly from the client.
+      {/* Execution Summary Footer */}
+      <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+        <div className="flex items-center gap-2">
+          <ShieldAlert className="w-4 h-4 text-cyan-400 flex-shrink-0" />
+          <span>Locust runs in headless background mode targeting <code className="text-slate-300 font-mono">target-app-service:8000</code>.</span>
         </div>
+        <span className="font-mono text-[11px] text-slate-400">HTTP Port 8000</span>
       </div>
     </div>
   );

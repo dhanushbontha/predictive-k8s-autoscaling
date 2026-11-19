@@ -184,16 +184,16 @@ export default function Forecasting({
                     : forecastStatus === 'waiting_for_data'
                     ? 'Waiting for Live Data'
                     : forecastStatus === 'stale'
-                    ? 'Stale (>45s Gate Closed)'
+                    ? 'Stale (>45s)'
                     : 'Forecast Error'
                 }
               />
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                Generated: {isFresh ? generatedTimeStr : 'Pending live data'}
+                {isFresh ? `Generated: ${generatedTimeStr}` : 'Awaiting data'}
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-0.5">
-              Fits live Prometheus request rates, computes Bayesian piecewise trend &amp; generates prediction horizon.
+              Real-time time-series modeling of incoming requests with Bayesian uncertainty bounds.
             </p>
           </div>
         </div>
@@ -210,28 +210,19 @@ export default function Forecasting({
         </div>
       </div>
 
-      {/* Warning/Error Banner when waiting for live observations or model fitting error */}
+      {/* Status banner when waiting for live observations or model fitting error */}
       {(!isFresh || activeError) && (
-        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex items-start gap-3">
-          <div className="p-2 rounded-lg bg-amber-500/20 text-amber-400 shrink-0 mt-0.5">
-            <Info className="w-5 h-5" />
-          </div>
-          <div className="space-y-1">
-            <div className="text-sm font-semibold text-amber-200">
-              {forecastStatus === 'waiting_for_data'
-                ? 'Forecasting Standby: Awaiting Live Prometheus Traffic Observations'
-                : forecastStatus === 'stale'
-                ? 'Forecast Validity Expired (>45s): KEDA Fallback Safeguard Triggered'
-                : 'Forecast Refresh Notice'}
-            </div>
-            <div className="text-xs text-slate-300 leading-relaxed">
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3.5 flex items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2.5">
+            <Info className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="text-amber-200">
               {activeError ||
-                'Prophet requires at least 5 consecutive request-rate observations on /api/work to train the time-series model. When observations are insufficient, old predictions are withheld to protect autoscaling integrity.'}
-            </div>
-            <div className="text-[11px] text-slate-400">
-              Tip: Go to the <span className="text-cyan-400 font-medium">Workload Generator</span> tab and start a traffic profile to generate live application metrics.
-            </div>
+                'Awaiting 5 traffic observations on /api/work. Launch a profile in the Workload tab to begin forecasting.'}
+            </span>
           </div>
+          <span className="text-[11px] text-slate-400 font-mono shrink-0">
+            Min 5 samples required
+          </span>
         </div>
       )}
 
@@ -440,69 +431,71 @@ export default function Forecasting({
         </div>
       </div>
 
-      {/* Model Points Inspector Table */}
-      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-100">
-              Raw Forecast Horizon Points Inspector
-            </h3>
-            <p className="text-xs text-slate-400">
-              Direct point-by-point values computed by Prophet model
-            </p>
+      {/* Raw Forecast Points Table (Hidden by default behind collapsible details) */}
+      <details className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm group">
+        <summary className="cursor-pointer font-semibold text-xs text-slate-300 flex items-center justify-between">
+          <span className="flex items-center gap-2">
+            <Database className="w-4 h-4 text-cyan-400" />
+            Raw Forecast Horizon Points Table ({displayForecastPoints.length} points)
+          </span>
+          <span className="text-[11px] font-mono text-cyan-400 group-open:rotate-180 transition-transform">▼</span>
+        </summary>
+
+        <div className="mt-4 space-y-3">
+          <div className="flex justify-end">
+            <input
+              type="text"
+              placeholder="Filter by time..."
+              value={tableSearch}
+              onChange={(e) => setTableSearch(e.target.value)}
+              className="px-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-cyan-500 font-mono w-48"
+            />
           </div>
-          <input
-            type="text"
-            placeholder="Filter by time..."
-            value={tableSearch}
-            onChange={(e) => setTableSearch(e.target.value)}
-            className="px-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-cyan-500 font-mono w-48"
-          />
-        </div>
 
-        <div className="max-h-64 overflow-y-auto">
-          <table className="w-full text-left text-xs font-mono">
-            <thead className="sticky top-0 bg-slate-900 border-b border-slate-800 text-slate-400">
-              <tr>
-                <th className="py-2 px-3">#</th>
-                <th className="py-2 px-3">Horizon Timestamp (ds)</th>
-                <th className="py-2 px-3 text-cyan-400">Predicted Load (yhat)</th>
-                <th className="py-2 px-3 text-slate-400">Lower Bound (yhat_lower)</th>
-                <th className="py-2 px-3 text-slate-400">Upper Bound (yhat_upper)</th>
-                <th className="py-2 px-3">Confidence Range</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/50">
-              {displayForecastPoints
-                .filter((p) => (p.ds || p.timestamp || '').toLowerCase().includes(tableSearch.toLowerCase()))
-                .map((pt, idx) => {
-                  const yhat = Number(pt.yhat || 0).toFixed(2);
-                  const lower = Number(Math.max(0, pt.yhat_lower || 0)).toFixed(2);
-                  const upper = Number(pt.yhat_upper || 0).toFixed(2);
-                  const spread = (upper - lower).toFixed(2);
-
-                  return (
-                    <tr key={idx} className="hover:bg-slate-800/30 transition-colors">
-                      <td className="py-2 px-3 text-slate-400">{idx + 1}</td>
-                      <td className="py-2 px-3 text-slate-300">{pt.ds || pt.timestamp || `+${idx * 15}s`}</td>
-                      <td className="py-2 px-3 text-cyan-400 font-semibold">{yhat} req/s</td>
-                      <td className="py-2 px-3 text-slate-400">{lower}</td>
-                      <td className="py-2 px-3 text-slate-400">{upper}</td>
-                      <td className="py-2 px-3 text-slate-400">&plusmn;{(spread / 2).toFixed(2)} req/s</td>
-                    </tr>
-                  );
-                })}
-              {displayForecastPoints.length === 0 && (
+          <div className="max-h-64 overflow-y-auto">
+            <table className="w-full text-left text-xs font-mono">
+              <thead className="sticky top-0 bg-slate-900 border-b border-slate-800 text-slate-400">
                 <tr>
-                  <td colSpan={6} className="py-6 text-center text-slate-400 font-sans">
-                    No forecast points currently generated.
-                  </td>
+                  <th className="py-2 px-3">#</th>
+                  <th className="py-2 px-3">Horizon Timestamp (ds)</th>
+                  <th className="py-2 px-3 text-cyan-400">Predicted Load (yhat)</th>
+                  <th className="py-2 px-3 text-slate-400">Lower Bound</th>
+                  <th className="py-2 px-3 text-slate-400">Upper Bound</th>
+                  <th className="py-2 px-3">Confidence Range</th>
                 </tr>
-              )}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-slate-800/50">
+                {displayForecastPoints
+                  .filter((p) => (p.ds || p.timestamp || '').toLowerCase().includes(tableSearch.toLowerCase()))
+                  .map((pt, idx) => {
+                    const yhat = Number(pt.yhat || 0).toFixed(2);
+                    const lower = Number(Math.max(0, pt.yhat_lower || 0)).toFixed(2);
+                    const upper = Number(pt.yhat_upper || 0).toFixed(2);
+                    const spread = (upper - lower).toFixed(2);
+
+                    return (
+                      <tr key={idx} className="hover:bg-slate-800/30 transition-colors">
+                        <td className="py-2 px-3 text-slate-400">{idx + 1}</td>
+                        <td className="py-2 px-3 text-slate-300">{pt.ds || pt.timestamp || `+${idx * 15}s`}</td>
+                        <td className="py-2 px-3 text-cyan-400 font-semibold">{yhat} req/s</td>
+                        <td className="py-2 px-3 text-slate-400">{lower}</td>
+                        <td className="py-2 px-3 text-slate-400">{upper}</td>
+                        <td className="py-2 px-3 text-slate-400">&plusmn;{(spread / 2).toFixed(2)} req/s</td>
+                      </tr>
+                    );
+                  })}
+                {displayForecastPoints.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="py-6 text-center text-slate-400 font-sans">
+                      No forecast points currently generated.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
-      </div>
+      </details>
     </div>
   );
 }

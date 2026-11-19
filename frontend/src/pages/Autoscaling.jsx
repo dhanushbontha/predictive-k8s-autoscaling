@@ -98,6 +98,8 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
   const metricThreshold = autoscalingStatus?.metric_threshold || 10.0;
   const minReplicas = autoscalingStatus?.min_replicas || k8sStatus?.min_replicas || 1;
   const maxReplicas = autoscalingStatus?.max_replicas || k8sStatus?.max_replicas || 5;
+  const currentReplicas = k8sStatus?.current_replicas ?? k8sStatus?.available_replicas ?? 1;
+  const desiredReplicas = autoscalingStatus?.desired_hpa_replicas ?? k8sStatus?.desired_replicas ?? currentReplicas;
 
   return (
     <div className="space-y-6">
@@ -108,38 +110,31 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
             <Gauge className="w-6 h-6" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h2 className="text-base font-semibold text-slate-100">
                 KEDA ScaledObject: {autoscalingStatus?.scaledobject_name || 'target-app-predictive-scaledobject'}
               </h2>
-              {/* ScaledObject READY Status */}
               <StatusBadge
                 status={readyStatus ? 'healthy' : 'error'}
                 label={readyStatus ? 'READY' : 'NOT READY'}
                 size="xs"
               />
-              {/* ScaledObject ACTIVE Status */}
               <StatusBadge
                 status={activeStatus ? 'active' : 'warning'}
                 label={activeStatus ? 'ACTIVE' : 'INACTIVE'}
                 size="xs"
               />
-              {/* ScaledObject FALLBACK Status */}
               <StatusBadge
                 status={fallbackActive ? 'fallback' : 'healthy'}
                 label={fallbackActive ? 'FALLBACK ACTIVE' : 'FALLBACK STANDBY'}
                 size="xs"
               />
+              <span className="text-xs px-2.5 py-0.5 rounded-full font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                Active Controller
+              </span>
             </div>
             <p className="text-xs text-slate-400 mt-1">
-              Associated HPA:{' '}
-              <span className="font-mono text-cyan-400">
-                {autoscalingStatus?.hpa_name || 'keda-hpa-target-app-predictive-scaledobject'}
-              </span>{' '}
-              &bull; Target:{' '}
-              <span className="font-mono text-slate-300">
-                {autoscalingStatus?.target_deployment || 'target-app'}
-              </span>
+              KEDA-Managed HPA: <span className="font-mono text-cyan-400 font-semibold">{autoscalingStatus?.hpa_name || 'keda-hpa-target-app-predictive-scaledobject'}</span> &bull; Target: <span className="font-mono text-slate-300">Deployment/{autoscalingStatus?.target_deployment || 'target-app'}</span> &bull; Metric: <span className="font-mono text-emerald-400">s0-prometheus (predicted_http_work_rps)</span>
             </p>
           </div>
         </div>
@@ -166,199 +161,194 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
           variant={metricVariant}
         />
         <MetricCard
-          title="Scaler Target Threshold"
+          title="Scaling Threshold"
           value={metricThreshold}
           unit="RPS / pod"
-          subtitle="AverageValue metric type"
+          subtitle="AverageValue target"
           icon={Sliders}
           variant="purple"
         />
         <MetricCard
-          title="Prediction Freshness"
-          value={freshnessAge !== null ? `${freshnessAge}s` : 'N/A'}
-          subtitle={
-            isGateValid
-              ? 'Within 45-second freshness window'
-              : 'Stale query: returns empty vector'
-          }
-          icon={Clock}
-          variant={isGateValid ? 'emerald' : 'amber'}
-        />
-        <MetricCard
-          title="Replica Boundaries"
-          value={`${minReplicas} - ${maxReplicas}`}
+          title="Current & Desired Replicas"
+          value={`${currentReplicas} / ${desiredReplicas}`}
           unit="pods"
-          subtitle={`Min: ${minReplicas} pod &bull; Max: ${maxReplicas} pods`}
+          subtitle={`Min: ${minReplicas} · Max: ${maxReplicas} pods`}
           icon={Layers}
           variant="emerald"
         />
+        <MetricCard
+          title="Freshness & Fallback"
+          value={freshnessAge !== null ? `${freshnessAge}s` : 'N/A'}
+          unit={isGateValid ? '(Valid)' : '(Stale)'}
+          subtitle={fallbackActive ? 'Fallback active: 2 pods' : 'Fallback standby: 3 fails'}
+          icon={Clock}
+          variant={isGateValid ? 'emerald' : 'amber'}
+        />
       </div>
 
-      {/* Visual Pipeline Flowchart */}
-      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm">
-        <h3 className="text-sm font-semibold text-slate-100 mb-4 flex items-center gap-2">
-          <Layers className="w-4 h-4 text-cyan-400" />
-          Predictive Autoscaling Pipeline Architecture
+      {/* Live KEDA HPA Conditions & External Metrics Info */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            KEDA HPA Conditions &amp; External Metric
+          </h3>
+          <span className="text-xs font-mono text-cyan-400 bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5 rounded">
+            Metric: s0-prometheus
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {(autoscalingStatus?.conditions && autoscalingStatus.conditions.length > 0) ? (
+            autoscalingStatus.conditions.map((cond, idx) => (
+              <div
+                key={idx}
+                className="p-3 bg-slate-950/80 rounded-lg border border-slate-800 space-y-1 text-xs"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-slate-200 font-mono">{cond.type}</span>
+                  <span
+                    className={`text-[10px] px-2 py-0.5 rounded font-mono ${
+                      cond.status === 'True'
+                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {cond.status}
+                  </span>
+                </div>
+                {cond.reason && (
+                  <div className="text-slate-400 text-[11px]">
+                    Reason: <span className="text-cyan-300 font-mono">{cond.reason}</span>
+                  </div>
+                )}
+                {cond.message && (
+                  <div className="text-slate-400 text-[11px] leading-relaxed line-clamp-2" title={cond.message}>
+                    {cond.message}
+                  </div>
+                )}
+              </div>
+            ))
+          ) : (
+            <div className="col-span-3 text-xs text-slate-400 py-2">
+              KEDA HPA conditions active: ValidMetricFound &bull; ReadyForNewScale &bull; DesiredWithinRange
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Scaling Events Log */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm space-y-3">
+        <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+          <Clock className="w-4 h-4 text-slate-400" />
+          KEDA ScaledObject &amp; HPA Scaling Events
         </h3>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-          <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
-            <span className="text-[10px] font-mono text-cyan-400 uppercase tracking-wider block mb-1">Step 1</span>
-            <div className="text-xs font-semibold text-slate-200">Prometheus Scrapes</div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Extracts incoming RPS from target-app pods
-            </p>
+        {autoscalingStatus?.scaling_events && autoscalingStatus.scaling_events.length > 0 ? (
+          <div className="divide-y divide-slate-800/60 text-xs font-mono max-h-60 overflow-y-auto">
+            {autoscalingStatus.scaling_events.map((evt, idx) => (
+              <div key={idx} className="py-2.5 flex items-start justify-between gap-3">
+                <div className="space-y-0.5 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`text-[10px] px-1.5 py-0.2 rounded font-bold uppercase ${
+                        evt.type === 'Warning'
+                          ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
+                          : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                      }`}
+                    >
+                      {evt.type}
+                    </span>
+                    <span className="text-slate-200 font-semibold font-sans">{evt.reason}</span>
+                    <span className="text-slate-400 text-[10px] font-mono">{evt.object}</span>
+                  </div>
+                  <div className="text-slate-400 text-[11px] font-sans truncate">{evt.message}</div>
+                </div>
+                <span className="text-slate-400 text-[10px] shrink-0 font-mono">
+                  {evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString() : 'Recent'}
+                </span>
+              </div>
+            ))}
           </div>
-
-          <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
-            <span className="text-[10px] font-mono text-purple-400 uppercase tracking-wider block mb-1">Step 2</span>
-            <div className="text-xs font-semibold text-slate-200">Prophet Backend</div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Fits time series &amp; exports predicted_http_work_rps gauge
-            </p>
+        ) : (
+          <div className="text-xs text-slate-400 py-3 text-center">
+            No active scaling warning events recorded for KEDA ScaledObject.
           </div>
-
-          <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
-            <span className="text-[10px] font-mono text-emerald-400 uppercase tracking-wider block mb-1">Step 3</span>
-            <div className="text-xs font-semibold text-slate-200">Freshness Gate</div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Enforces 45s cutoff timestamp to prevent stale scaling
-            </p>
-          </div>
-
-          <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
-            <span className="text-[10px] font-mono text-amber-400 uppercase tracking-wider block mb-1">Step 4</span>
-            <div className="text-xs font-semibold text-slate-200">KEDA Scaler</div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Polls every 5s &amp; evaluates 10 RPS/pod AverageValue threshold
-            </p>
-          </div>
-
-          <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
-            <span className="text-[10px] font-mono text-rose-400 uppercase tracking-wider block mb-1">Step 5</span>
-            <div className="text-xs font-semibold text-slate-200">Kubernetes HPA</div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Adjusts target-app replicas: 0s up-stabilization, 15s down
-            </p>
-          </div>
-        </div>
+        )}
       </div>
 
-      {/* Freshness Gate & Fallback Specification Cards */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Freshness Gate Card */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
-              <Clock className="w-4 h-4 text-emerald-400" />
-              KEDA Freshness Gate Validation
-            </h3>
-            <span
-              className={`text-xs px-2 py-0.5 rounded font-mono ${
-                isGateValid
-                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
-                  : 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
-              }`}
-            >
-              {isGateValid ? 'Gate Valid (<45s)' : 'Gate Expired'}
-            </span>
-          </div>
+      {/* Advanced Details (Collapsible): Pipeline Architecture, PromQL Query, and Fallback Mechanics */}
+      <details className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm group">
+        <summary className="cursor-pointer font-semibold text-xs text-slate-300 flex items-center justify-between">
+          <span className="flex items-center gap-2">
+            <Settings className="w-4 h-4 text-slate-400" />
+            Advanced Details: Architecture, PromQL Trigger &amp; Stabilization Policies
+          </span>
+          <span className="text-[11px] font-mono text-cyan-400 group-open:rotate-180 transition-transform">▼</span>
+        </summary>
 
-          <div className="p-3 bg-slate-950 rounded-lg border border-slate-800">
-            <div className="text-xs text-slate-400 mb-1">
-              Live PromQL Trigger Query (Retrieved from ScaledObject Manifest):
-            </div>
-            <div className="font-mono text-xs text-cyan-300 break-all bg-slate-900 p-2.5 rounded border border-slate-800 leading-relaxed">
-              {activeQuery}
-            </div>
-          </div>
+        <div className="mt-5 space-y-5">
+          {/* Visual Pipeline Flowchart */}
+          <div>
+            <h4 className="text-xs font-semibold text-slate-300 mb-2">Autoscaling Architecture Flow</h4>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+              <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
+                <span className="text-[10px] font-mono text-cyan-400 uppercase tracking-wider block mb-1">Step 1</span>
+                <div className="text-xs font-semibold text-slate-200">Prometheus Scrapes</div>
+                <p className="text-[11px] text-slate-400 mt-1">Extracts incoming RPS from target-app pods</p>
+              </div>
 
-          <div className="space-y-2 text-xs text-slate-300 leading-relaxed">
-            <p>
-              <strong>Why this is essential:</strong> Without a timestamp gate, if the forecasting backend stops updating, Prometheus holds the last gauge value indefinitely. KEDA would continuously scale based on that stale value.
-            </p>
-            <p>
-              <strong>How it works:</strong> If <code className="text-cyan-400 font-mono">time() - max(prediction_timestamp_seconds) &gt;= 45</code>, the PromQL query evaluates to an empty vector, signaling to KEDA that live predictions are unavailable.
-            </p>
-          </div>
-        </div>
+              <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
+                <span className="text-[10px] font-mono text-purple-400 uppercase tracking-wider block mb-1">Step 2</span>
+                <div className="text-xs font-semibold text-slate-200">Prophet Backend</div>
+                <p className="text-[11px] text-slate-400 mt-1">Fits time series &amp; exports predicted_http_work_rps gauge</p>
+              </div>
 
-        {/* Fallback Configuration Card */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
-              <ShieldCheck className="w-4 h-4 text-purple-400" />
-              Automated Fallback Protection
-            </h3>
-            <span
-              className={`text-xs px-2 py-0.5 rounded font-mono ${
-                fallbackActive
-                  ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30 animate-pulse'
-                  : 'bg-slate-800 text-slate-400'
-              }`}
-            >
-              {fallbackActive ? 'Active' : 'Standby'}
-            </span>
-          </div>
+              <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
+                <span className="text-[10px] font-mono text-emerald-400 uppercase tracking-wider block mb-1">Step 3</span>
+                <div className="text-xs font-semibold text-slate-200">Freshness Gate</div>
+                <p className="text-[11px] text-slate-400 mt-1">Enforces 45s cutoff timestamp to prevent stale scaling</p>
+              </div>
 
-          <div className="grid grid-cols-2 gap-3 font-mono text-xs">
-            <div className="p-3 bg-slate-950 rounded-lg border border-slate-800">
-              <span className="text-slate-400 font-sans block mb-1">Failure Threshold</span>
-              <span className="text-slate-100 text-base font-bold">
-                {autoscalingStatus?.fallback_threshold || 3}
-              </span>
-              <span className="text-slate-400 font-sans block text-[11px] mt-0.5">Consecutive query fails</span>
-            </div>
-            <div className="p-3 bg-slate-950 rounded-lg border border-slate-800">
-              <span className="text-slate-400 font-sans block mb-1">Fallback Replicas</span>
-              <span className="text-amber-400 text-base font-bold">
-                {autoscalingStatus?.fallback_replicas || 2}
-              </span>
-              <span className="text-slate-400 font-sans block text-[11px] mt-0.5">Guaranteed safe pods</span>
+              <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
+                <span className="text-[10px] font-mono text-amber-400 uppercase tracking-wider block mb-1">Step 4</span>
+                <div className="text-xs font-semibold text-slate-200">KEDA Scaler</div>
+                <p className="text-[11px] text-slate-400 mt-1">Polls every 5s &amp; evaluates 10 RPS/pod threshold</p>
+              </div>
+
+              <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80">
+                <span className="text-[10px] font-mono text-rose-400 uppercase tracking-wider block mb-1">Step 5</span>
+                <div className="text-xs font-semibold text-slate-200">Kubernetes HPA</div>
+                <p className="text-[11px] text-slate-400 mt-1">Adjusts target-app replicas: 0s up, 15s down</p>
+              </div>
             </div>
           </div>
 
-          <div className="p-3 bg-slate-950/60 rounded-lg border border-slate-800/80 text-xs text-slate-300 leading-relaxed">
-            <p>
-              When Prometheus or the forecasting backend experiences downtime, KEDA activates fallback after 3 failed polling cycles (15s), pinning the deployment to <strong>2 replicas</strong> to prevent outages.
-            </p>
-          </div>
-        </div>
-      </div>
+          {/* PromQL & Fallback Specs */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="p-4 bg-slate-950 rounded-lg border border-slate-800 space-y-2">
+              <span className="text-xs font-semibold text-slate-200">PromQL Trigger Query</span>
+              <div className="font-mono text-xs text-cyan-300 break-all bg-slate-900 p-2.5 rounded border border-slate-800 leading-relaxed">
+                {activeQuery}
+              </div>
+              <p className="text-[11px] text-slate-400">
+                If prediction age exceeds 45s, the query evaluates to empty vector, preventing stale scaling.
+              </p>
+            </div>
 
-      {/* HPA Behavior Specifications */}
-      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm">
-        <h3 className="text-sm font-semibold text-slate-100 mb-3 flex items-center gap-2">
-          <Settings className="w-4 h-4 text-slate-400" />
-          HPA Scaling Behavior Rules (Scale-Up &amp; Scale-Down)
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
-          <div className="p-3.5 bg-slate-950/80 rounded-lg border border-slate-800 space-y-2">
-            <div className="text-emerald-400 font-sans font-semibold flex items-center gap-1.5">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              Scale-Up Policy (Aggressive Predictive Scale)
-            </div>
-            <div className="text-slate-300">
-              <span className="text-slate-400">stabilizationWindowSeconds:</span> 0 (Immediate reaction)
-            </div>
-            <div className="text-slate-300">
-              <span className="text-slate-400">policy:</span> Up to 4 pods every 15 seconds
-            </div>
-          </div>
-          <div className="p-3.5 bg-slate-950/80 rounded-lg border border-slate-800 space-y-2">
-            <div className="text-cyan-400 font-sans font-semibold flex items-center gap-1.5">
-              <Clock className="w-3.5 h-3.5" />
-              Scale-Down Policy (Controlled Cooldown)
-            </div>
-            <div className="text-slate-300">
-              <span className="text-slate-400">stabilizationWindowSeconds:</span> 15 (Smooth recovery)
-            </div>
-            <div className="text-slate-300">
-              <span className="text-slate-400">policy:</span> Up to 100% allowed scale-down per 15s window
+            <div className="p-4 bg-slate-950 rounded-lg border border-slate-800 space-y-2">
+              <span className="text-xs font-semibold text-slate-200">Fallback Configuration</span>
+              <div className="flex gap-4 text-xs font-mono">
+                <div>Failure Threshold: <span className="text-slate-100 font-bold">{autoscalingStatus?.fallback_threshold || 3} fails</span></div>
+                <div>Fallback Replicas: <span className="text-amber-400 font-bold">{autoscalingStatus?.fallback_replicas || 2} pods</span></div>
+              </div>
+              <p className="text-[11px] text-slate-400">
+                Guarantees continuity by pinning deployment to 2 safe replicas if telemetry becomes unavailable.
+              </p>
             </div>
           </div>
         </div>
-      </div>
+      </details>
     </div>
   );
 }

@@ -15,7 +15,8 @@ export default function Navbar({
     overview: { title: 'Overview Dashboard', desc: 'Real-time metrics, load predictions & cluster utilization' },
     forecasting: { title: 'Workload Forecasting', desc: 'Prophet time-series load prediction & uncertainty envelope' },
     kubernetes: { title: 'Kubernetes Cluster & Pods', desc: 'Pod resources, deployment replicas & node metrics' },
-    autoscaling: { title: 'Predictive Autoscaling (KEDA)', desc: 'ScaledObject evaluation, query freshness gate & fallback' },
+    autoscaling: { title: 'Predictive Autoscaling (KEDA)', desc: 'Prophet-driven ScaledObject, query freshness gate & fallback' },
+    'cpu-hpa': { title: 'Traditional CPU HPA (Baseline)', desc: 'Resource-based autoscaling evaluation, 50% CPU target & scaling conditions' },
     workload: { title: 'Workload Generator', desc: 'Locust benchmark profile executor (bursty, gradual, periodic)' },
     experiments: { title: 'Benchmark & Evaluation', desc: 'Baseline CPU HPA vs Predictive KEDA comparison' },
   };

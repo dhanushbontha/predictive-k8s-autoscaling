@@ -4,6 +4,7 @@ import React from 'react';
   TrendingUp,
   Server,
   Gauge,
+  Cpu,
   Zap,
   BarChart3,
   Layers,
@@ -14,7 +15,8 @@ const NAV_ITEMS = [
   { id: 'overview', label: 'Overview', icon: Activity, desc: 'Live System State' },
   { id: 'forecasting', label: 'Forecasting', icon: TrendingUp, desc: 'Prophet Model & Load' },
   { id: 'kubernetes', label: 'Cluster & Pods', icon: Server, desc: 'Target-App Deployment' },
-  { id: 'autoscaling', label: 'Autoscaler (KEDA)', icon: Gauge, desc: 'Freshness & Scaling Rules' },
+  { id: 'autoscaling', label: 'Predictive KEDA', icon: Gauge, desc: 'External Load Scaler' },
+  { id: 'cpu-hpa', label: 'CPU HPA (Baseline)', icon: Cpu, desc: 'Resource-Based Scaler' },
   { id: 'workload', label: 'Workload Generator', icon: Zap, desc: 'Locust Benchmark Runner' },
   { id: 'experiments', label: 'Benchmarks', icon: BarChart3, desc: 'HPA vs Predictive Eval' },
 ];

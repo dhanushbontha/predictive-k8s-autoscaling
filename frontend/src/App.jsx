@@ -5,6 +5,7 @@ import Overview from './pages/Overview';
 import Forecasting from './pages/Forecasting';
 import Kubernetes from './pages/Kubernetes';
 import Autoscaling from './pages/Autoscaling';
+import CpuHpa from './pages/CpuHpa';
 import Workload from './pages/Workload';
 import Experiments from './pages/Experiments';
 import api from './services/api';
@@ -17,8 +18,10 @@ export default function App() {
   const [forecastError, setForecastError] = useState(null);
   const [k8sStatus, setK8sStatus] = useState(null);
   const [autoscalingStatus, setAutoscalingStatus] = useState(null);
+  const [cpuHpaStatus, setCpuHpaStatus] = useState(null);
   const [workloadStatus, setWorkloadStatus] = useState(null);
   const [comparisonData, setComparisonData] = useState(null);
+  const [experimentSource, setExperimentSource] = useState('results');
 
   const [backendHealthy, setBackendHealthy] = useState(false);
   const [prometheusHealthy, setPrometheusHealthy] = useState(false);
@@ -32,13 +35,14 @@ export default function App() {
   // Fetch live metrics (every 5 seconds)
   const fetchLiveMetrics = useCallback(async () => {
     try {
-      const [healthRes, metricsRes, k8sRes, autoRes, workloadRes] =
+      const [healthRes, metricsRes, k8sRes, autoRes, workloadRes, cpuHpaRes] =
         await Promise.allSettled([
           api.getHealth(),
           api.getMetrics(),
           api.getKubernetesStatus(),
           api.getAutoscalingStatus(),
           api.getWorkloadStatus(),
+          api.getCpuHpaStatus(),
         ]);
 
       if (!isMountedRef.current) return;
@@ -89,6 +93,10 @@ export default function App() {
         setWorkloadStatus(workloadRes.value);
       }
 
+      if (cpuHpaRes.status === 'fulfilled') {
+        setCpuHpaStatus(cpuHpaRes.value);
+      }
+
       setLastUpdated(new Date());
     } catch (err) {
       console.error('Error fetching live metrics:', err);
@@ -114,11 +122,14 @@ export default function App() {
     }
   }, []);
 
-  // Fetch experiment comparison (cached on load or when viewing tab)
-  const fetchExperiments = useCallback(async () => {
+  // Fetch experiment comparison (clean results by default, or historical backup)
+  const fetchExperiments = useCallback(async (source = 'results') => {
     try {
-      const res = await api.getExperimentComparison();
-      if (isMountedRef.current) setComparisonData(res);
+      const res = await api.getExperimentComparison(source);
+      if (isMountedRef.current) {
+        setComparisonData(res);
+        setExperimentSource(source);
+      }
     } catch (err) {
       console.warn('Could not load experiment benchmarks:', err);
     }
@@ -130,7 +141,7 @@ export default function App() {
     await Promise.allSettled([
       fetchLiveMetrics(),
       fetchForecast(true),
-      activeTab === 'experiments' ? fetchExperiments() : Promise.resolve(),
+      activeTab === 'experiments' ? fetchExperiments(experimentSource) : Promise.resolve(),
     ]);
     if (isMountedRef.current) setIsRefreshing(false);
   };
@@ -242,6 +253,10 @@ export default function App() {
             />
           )}
 
+          {activeTab === 'cpu-hpa' && (
+            <CpuHpa cpuHpaStatus={cpuHpaStatus} k8sStatus={k8sStatus} />
+          )}
+
           {activeTab === 'workload' && (
             <Workload
               workloadStatus={workloadStatus}
@@ -252,7 +267,12 @@ export default function App() {
           )}
 
           {activeTab === 'experiments' && (
-            <Experiments comparisonData={comparisonData} />
+            <Experiments
+              comparisonData={comparisonData}
+              experimentSource={experimentSource}
+              onNavigate={setActiveTab}
+              onFetchExperiments={fetchExperiments}
+            />
           )}
         </main>
       </div>

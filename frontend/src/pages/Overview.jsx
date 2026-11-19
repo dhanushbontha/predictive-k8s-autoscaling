@@ -238,25 +238,24 @@ export default function Overview({
           title="Desired Replicas"
           value={desiredReplicas}
           unit="pods"
-          subtitle="Actual HPA target size"
+          subtitle={`Target size (min: ${k8sStatus?.min_replicas || 1})`}
           icon={Layers}
           variant="amber"
         />
         <MetricCard
-          title="Cluster CPU Usage"
-          value={cpuMillicores}
-          unit="m"
-          subtitle={`${cpuPercent}% of allocated requests`}
-          icon={Cpu}
-          variant="cyan"
+          title="Active Autoscaler"
+          value={autoscalingStatus?.active_controller === 'cpu-hpa' ? 'CPU HPA' : 'Predictive KEDA'}
+          subtitle={autoscalingStatus?.active_controller === 'cpu-hpa' ? 'Reactive CPU target (50%)' : 'Proactive request scaler'}
+          icon={ShieldCheck}
+          variant="purple"
         />
         <MetricCard
-          title="Cluster Memory"
-          value={memFormatted}
-          unit="MiB"
-          subtitle={`${memPercent}% of working set req`}
-          icon={Database}
-          variant="emerald"
+          title="Cluster Resources"
+          value={`${cpuMillicores}m`}
+          unit={`/ ${memFormatted} MiB`}
+          subtitle={`${cpuPercent}% CPU · ${memPercent}% RAM`}
+          icon={Cpu}
+          variant="cyan"
         />
       </div>
 
@@ -389,14 +388,6 @@ export default function Overview({
             </div>
 
             <div className="space-y-3">
-              <div className="p-3 bg-slate-950/50 rounded-lg border border-slate-800/80">
-                <div className="text-xs text-slate-400 mb-1">Active KEDA Trigger Query</div>
-                <div className="font-mono text-[11px] text-cyan-300 break-all bg-slate-900 p-2 rounded border border-slate-800 leading-relaxed">
-                  {autoscalingStatus?.query ||
-                    'max(predicted_http_work_rps) and (max(prediction_timestamp_seconds) > 0) and ((time() - max(prediction_timestamp_seconds)) < 45)'}
-                </div>
-              </div>
-
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60">
                   <span className="text-slate-400 block mb-0.5">Scale Target</span>
@@ -424,9 +415,21 @@ export default function Overview({
                 <span className="text-slate-400">Failover Mode</span>
                 <span className="font-mono text-slate-200">
                   Fallback to {autoscalingStatus?.fallback_replicas || 2} pods after{' '}
-                  {autoscalingStatus?.fallback_threshold || 3} failures
+                  {autoscalingStatus?.fallback_threshold || 3} fails
                 </span>
               </div>
+
+              {/* Collapsible PromQL Trigger Details */}
+              <details className="p-2.5 bg-slate-950/50 rounded-lg border border-slate-800/80 text-xs group">
+                <summary className="cursor-pointer text-slate-400 hover:text-slate-200 font-medium flex items-center justify-between">
+                  <span>View PromQL Trigger Query</span>
+                  <span className="text-[10px] text-cyan-400 group-open:rotate-180 transition-transform">▼</span>
+                </summary>
+                <div className="mt-2 font-mono text-[11px] text-cyan-300 break-all bg-slate-900 p-2 rounded border border-slate-800 leading-relaxed">
+                  {autoscalingStatus?.query ||
+                    'max(predicted_http_work_rps) and (max(prediction_timestamp_seconds) > 0) and ((time() - max(prediction_timestamp_seconds)) < 45)'}
+                </div>
+              </details>
             </div>
           </div>
 
@@ -441,74 +444,33 @@ export default function Overview({
         </div>
       </div>
 
-      {/* Cluster Pods Quick Status */}
-      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm">
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
-              <Server className="w-4 h-4 text-emerald-400" />
-              Target Application Pods (Deployment: {k8sStatus?.deployment_name || 'target-app'})
-            </h3>
-            <p className="text-xs text-slate-400">
-              Namespace: {k8sStatus?.namespace || 'default'} &bull; Min: {k8sStatus?.min_replicas || 1} &bull; Max:{' '}
-              {maxReplicas} pods
-            </p>
+      {/* Cluster Pods Quick Status Summary */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 backdrop-blur-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="p-2.5 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            <Server className="w-5 h-5" />
           </div>
-          <button
-            onClick={() => onNavigate('kubernetes')}
-            className="text-xs text-cyan-400 hover:text-cyan-300 font-medium flex items-center gap-1"
-          >
-            Cluster Details <ArrowUpRight className="w-3.5 h-3.5" />
-          </button>
+          <div>
+            <div className="text-xs font-semibold text-slate-200 flex items-center gap-2">
+              <span>Target Application Pods</span>
+              <span className="text-slate-400 font-normal">({k8sStatus?.deployment_name || 'target-app'})</span>
+              <StatusBadge
+                status={k8sStatus?.cluster_connected ? 'healthy' : 'warning'}
+                label={`${currentReplicas} / ${maxReplicas} Pods Active`}
+                size="xs"
+              />
+            </div>
+            <div className="text-[11px] text-slate-400 mt-0.5">
+              Available: <span className="text-emerald-400 font-semibold">{k8sStatus?.available_replicas ?? currentReplicas}</span> ready &bull; CPU: <span className="text-cyan-400 font-semibold">{cpuMillicores}m</span> &bull; Memory: <span className="text-slate-300 font-semibold">{memFormatted} MiB</span>
+            </div>
+          </div>
         </div>
-
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-800 text-slate-400">
-                <th className="pb-3 font-medium">Pod Name</th>
-                <th className="pb-3 font-medium">Phase</th>
-                <th className="pb-3 font-medium">Ready</th>
-                <th className="pb-3 font-medium">Restarts</th>
-                <th className="pb-3 font-medium">CPU Usage</th>
-                <th className="pb-3 font-medium">Memory</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60 font-mono">
-              {(k8sStatus?.pods || []).map((pod) => (
-                <tr key={pod.name} className="hover:bg-slate-800/30 transition-colors">
-                  <td className="py-2.5 font-medium text-slate-200">{pod.name}</td>
-                  <td className="py-2.5">
-                    <StatusBadge
-                      status={pod.phase === 'Running' ? 'running' : 'warning'}
-                      label={pod.phase}
-                      size="xs"
-                    />
-                  </td>
-                  <td className="py-2.5 text-slate-300">{pod.ready ? '1/1' : '0/1'}</td>
-                  <td className="py-2.5 text-slate-300">{pod.restarts ?? 0}</td>
-                  <td className="py-2.5 text-cyan-400">
-                    {pod.cpu_cores !== undefined && pod.cpu_cores !== null
-                      ? `${(pod.cpu_cores * 1000).toFixed(1)}m`
-                      : '--'}
-                  </td>
-                  <td className="py-2.5 text-slate-300">
-                    {pod.memory_mb !== undefined && pod.memory_mb !== null
-                      ? `${pod.memory_mb.toFixed(1)} MiB`
-                      : '--'}
-                  </td>
-                </tr>
-              ))}
-              {(!k8sStatus?.pods || k8sStatus.pods.length === 0) && (
-                <tr>
-                  <td colSpan={6} className="py-4 text-center text-slate-400 font-sans">
-                    No active pods reported for deployment &quot;target-app&quot;.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+        <button
+          onClick={() => onNavigate('kubernetes')}
+          className="text-xs text-cyan-400 hover:text-cyan-300 font-medium flex items-center gap-1 self-start sm:self-auto shrink-0 px-3 py-1.5 rounded-lg bg-slate-800/60 border border-slate-700/60 hover:bg-slate-800 transition-colors"
+        >
+          View Pods & Resource Limits <ArrowUpRight className="w-3.5 h-3.5" />
+        </button>
       </div>
     </div>
   );
