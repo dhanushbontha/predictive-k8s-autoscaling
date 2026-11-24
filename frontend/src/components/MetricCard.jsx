@@ -9,6 +9,8 @@ export default function MetricCard({
   variant = 'cyan', // 'cyan', 'emerald', 'amber', 'purple', 'rose'
   badge,
   loading = false,
+  className = '',
+  valueClassName = '',
 }) {
   const variantStyles = {
     cyan: {
@@ -40,6 +42,23 @@ export default function MetricCard({
 
   const style = variantStyles[variant] || variantStyles.cyan;
 
+  const getValueTypography = () => {
+    if (valueClassName) return valueClassName;
+    const valStr = String(value ?? '');
+    const hasLetters = /[a-zA-Z]/.test(valStr);
+    const len = valStr.length;
+
+    if (hasLetters) {
+      if (len > 14) return 'text-base sm:text-lg font-bold font-sans leading-tight break-words';
+      if (len > 8) return 'text-xl sm:text-2xl font-bold font-sans tracking-tight leading-snug break-words';
+      return 'text-2xl sm:text-3xl font-bold font-sans tracking-tight';
+    }
+
+    if (len > 10) return 'text-xl sm:text-2xl font-bold font-mono tracking-tight';
+    if (len > 7) return 'text-2xl sm:text-3xl font-bold font-mono tracking-tight';
+    return 'text-3xl font-bold font-mono tracking-tight';
+  };
+
   if (loading) {
     return (
       <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 animate-pulse">
@@ -55,7 +74,7 @@ export default function MetricCard({
 
   return (
     <div
-      className={`relative bg-slate-900/60 backdrop-blur-sm border ${style.border} rounded-xl p-4 sm:p-5 transition-all duration-300 hover:shadow-lg hover:shadow-black/40 overflow-hidden group`}
+      className={`relative bg-slate-900/60 backdrop-blur-sm border ${style.border} rounded-xl p-3.5 sm:p-4.5 transition-all duration-300 hover:shadow-lg hover:shadow-black/40 overflow-hidden group min-w-0 ${className}`}
     >
       {/* Subtle background glow */}
       <div
@@ -64,7 +83,7 @@ export default function MetricCard({
 
       <div className="relative z-10 flex items-start justify-between gap-2 mb-3">
         <div className="flex flex-col min-w-0 flex-1">
-          <span className="text-xs font-medium uppercase tracking-normal text-slate-400 leading-snug">
+          <span className="text-xs font-medium uppercase tracking-normal text-slate-400 leading-snug truncate">
             {title}
           </span>
           {badge && <div className="mt-1">{badge}</div>}
@@ -78,11 +97,14 @@ export default function MetricCard({
         )}
       </div>
 
-      <div className="relative z-10 flex items-baseline gap-2">
-        <span className="text-3xl font-bold tracking-tight text-slate-100 font-mono">
+      <div className="relative z-10 flex items-baseline gap-2 flex-wrap min-w-0">
+        <span
+          className={`${getValueTypography()} text-slate-100 min-w-0`}
+          title={value !== undefined && value !== null ? String(value) : '--'}
+        >
           {value !== undefined && value !== null ? value : '--'}
         </span>
-        {unit && <span className="text-sm font-semibold text-slate-400">{unit}</span>}
+        {unit && <span className="text-sm font-semibold text-slate-400 shrink-0">{unit}</span>}
       </div>
 
       {subtitle && (

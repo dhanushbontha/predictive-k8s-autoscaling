@@ -13,22 +13,45 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+import io
 from pathlib import Path
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+import zipfile
 
 import numpy as np
 import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 
 # Base repository directory
-BASE_DIR = Path(__file__).resolve().parent.parent
+_file_dir = Path(__file__).resolve().parent
+if (_file_dir / "experiments").is_dir() or _file_dir.name == "app":
+    BASE_DIR = _file_dir
+elif (_file_dir.parent / "experiments").is_dir():
+    BASE_DIR = _file_dir.parent
+else:
+    BASE_DIR = _file_dir.parent
+
+EXPERIMENTS_DIR = Path(os.getenv("EXPERIMENTS_DIR", str(BASE_DIR / "experiments")))
+
+
+def get_experiments_dir(source: str = "results") -> Path:
+    """Returns the resolved experiments directory path based on source selection."""
+    if source.lower() == "historical":
+        exp_dir = EXPERIMENTS_DIR
+    else:
+        exp_dir = EXPERIMENTS_DIR / "results"
+    try:
+        exp_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Could not create experiments directory {exp_dir}: {e}")
+    return exp_dir
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -75,14 +98,6 @@ MIN_OBSERVATIONS_FOR_FIT = int(os.getenv("MIN_OBSERVATIONS_FOR_FIT", "5"))
 FORECAST_CACHE_TTL_SECONDS = int(os.getenv("FORECAST_CACHE_TTL_SECONDS", "30"))  # Cache for 30s
 RANDOM_SEED = int(os.getenv("FORECAST_SEED", "42"))
 
-# Fallback configuration
-ENABLE_STATIC_FALLBACK = os.getenv("ENABLE_STATIC_FALLBACK", "false").lower() in ("true", "1", "yes")
-DEFAULT_FORECAST_CSV = os.getenv(
-    "FORECAST_CSV_PATH", str(BASE_DIR / "forecasting" / "forecast_periodic.csv")
-)
-DEFAULT_METRICS_CSV = os.getenv(
-    "METRICS_CSV_PATH", str(BASE_DIR / "experiments" / "hpa_periodic.csv")
-)
 DEFAULT_PREDICTION_HORIZON_STEPS = int(os.getenv("PREDICTION_HORIZON_STEPS", "5"))
 
 # Automatic prediction refresh configuration
@@ -101,6 +116,11 @@ _forecast_lock = threading.RLock()
 _last_forecast_error: Optional[str] = None
 _last_forecast_error_lock = threading.Lock()
 
+_last_fitting_timestamp: Optional[float] = None
+_last_observation_count: int = 0
+_is_fitting: bool = False
+_state_lock = threading.Lock()
+
 
 def set_last_forecast_error(err: Optional[str]):
     global _last_forecast_error
@@ -111,6 +131,69 @@ def set_last_forecast_error(err: Optional[str]):
 def get_last_forecast_error() -> Optional[str]:
     with _last_forecast_error_lock:
         return _last_forecast_error
+
+
+def set_last_fitting_timestamp(ts: Optional[float]):
+    global _last_fitting_timestamp
+    with _state_lock:
+        _last_fitting_timestamp = ts
+
+
+def get_last_fitting_timestamp() -> Optional[float]:
+    with _state_lock:
+        return _last_fitting_timestamp
+
+
+def set_last_observation_count(cnt: int):
+    global _last_observation_count
+    with _state_lock:
+        _last_observation_count = cnt
+
+
+def get_last_observation_count() -> int:
+    with _state_lock:
+        return _last_observation_count
+
+
+def set_is_fitting(flag: bool):
+    global _is_fitting
+    with _state_lock:
+        _is_fitting = flag
+
+
+def get_is_fitting() -> bool:
+    with _state_lock:
+        return _is_fitting
+
+
+def get_model_status() -> str:
+    """
+    Returns human-readable model status:
+    - 'Training/Fitting' if Prophet is currently fitting.
+    - 'Forecasting' if recent forecast is fresh (<45s) and valid.
+    - 'Waiting for data' if insufficient observations or awaiting traffic.
+    - 'Error' if an unexpected failure occurred.
+    """
+    if get_is_fitting():
+        return "Training/Fitting"
+    err = get_last_forecast_error()
+    last_pred_ts = PREDICTION_TIMESTAMP_GAUGE._value.get()
+    now = time.time()
+    if last_pred_ts > 0 and (now - last_pred_ts) < 45.0 and not err:
+        return "Forecasting"
+    if err:
+        err_lower = err.lower()
+        if (
+            "insufficient" in err_lower
+            or "waiting for sufficient" in err_lower
+            or "at least 5" in err_lower
+            or "no observations" in err_lower
+        ):
+            return "Waiting for data"
+        return "Error"
+    if last_pred_ts == 0 or (now - last_pred_ts) >= 45.0:
+        return "Waiting for data"
+    return "Waiting for data"
 
 
 @asynccontextmanager
@@ -149,7 +232,7 @@ PREDICTED_LOAD_GAUGE = Gauge(
 )
 PREDICTION_PROVENANCE_GAUGE = Gauge(
     "prediction_provenance",
-    "Source of prediction: 1 for live_prometheus, 0 for static_csv_fallback.",
+    "Source of prediction: 1 for live_prometheus, 0 for inactive/none.",
 )
 PREDICTION_TIMESTAMP_GAUGE = Gauge(
     "prediction_timestamp_seconds",
@@ -172,7 +255,6 @@ class HealthResponse(BaseModel):
     version: str
     prometheus_configured: bool
     prometheus_connected: bool = False
-    static_fallback_enabled: bool
     auto_refresh_enabled: bool = True
     refresh_interval_seconds: float = 15.0
     background_task_running: bool = False
@@ -180,6 +262,10 @@ class HealthResponse(BaseModel):
     prediction_age_seconds: Optional[float] = None
     is_fresh: bool = False
     last_forecast_error: Optional[str] = None
+    last_fitting_timestamp: Optional[float] = None
+    valid_historical_observations: int = 0
+    model_status: str = "Waiting for data"
+    prediction_source: str = "Live Prophet only"
 
 
 class HistoricalItem(BaseModel):
@@ -195,13 +281,17 @@ class ForecastItem(BaseModel):
 
 
 class ForecastResponse(BaseModel):
-    provenance: str = Field(..., description="'live_prometheus' or 'static_csv_fallback'")
+    provenance: str = Field(..., description="'live_prometheus' or 'none'")
     source_detail: str
     total_points: int
     data: List[ForecastItem]
     history: List[HistoricalItem] = Field(default_factory=list)
     generated_at_epoch: float
     horizon_steps: int = 15
+    last_fitting_timestamp: Optional[float] = None
+    valid_historical_observations: int = 0
+    model_status: str = "Waiting for data"
+    prediction_source: str = "Live Prophet only"
 
 
 class ObservedMetrics(BaseModel):
@@ -230,10 +320,14 @@ class MetricsResponse(BaseModel):
         None, description="Latest observed measurement (from live Prometheus or historical experiment)."
     )
     forecast: Optional[ForecastSummary] = Field(
-        None, description="Latest predicted value from live Prophet model or fallback."
+        None, description="Latest predicted value from live Prophet model."
     )
-    provenance: str = Field(..., description="Source of metrics: 'live_prometheus' or 'static_csv_fallback'")
+    provenance: str = Field(..., description="Source of metrics: 'live_prometheus' or 'none'")
     note: str
+    last_fitting_timestamp: Optional[float] = None
+    valid_historical_observations: int = 0
+    model_status: str = "Waiting for data"
+    prediction_source: str = "Live Prophet only"
 
 
 class PredictedLoadResponse(BaseModel):
@@ -243,7 +337,7 @@ class PredictedLoadResponse(BaseModel):
     target_timestamp: str
     horizon_steps: int
     calculation_method: str
-    provenance: str = Field(..., description="'live_prometheus' or 'static_csv_fallback'")
+    provenance: str = Field(..., description="'live_prometheus' or 'none'")
     keda_integration_status: str = Field(
         default="ready_for_keda_external_scaler",
         description="States readiness for KEDA external metric consumption; not yet active KEDA scaler.",
@@ -359,6 +453,18 @@ def fetch_prometheus_range_metrics(
     return clean_pairs
 
 
+def to_utc_iso(dt_val) -> str:
+    """Converts a timestamp or datetime-like value into an ISO-8601 string with explicit UTC offset."""
+    if dt_val is None:
+        return ""
+    if isinstance(dt_val, (int, float)):
+        return pd.to_datetime(float(dt_val), unit="s", utc=True).isoformat()
+    ts = pd.to_datetime(dt_val)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC").isoformat()
+    return ts.tz_convert("UTC").isoformat()
+
+
 def parse_prometheus_to_prophet_dataframe(
     points: List[Tuple[float, float]],
     min_observations: int = 5,
@@ -367,10 +473,12 @@ def parse_prometheus_to_prophet_dataframe(
     Converts list of (timestamp, value) pairs into Prophet DataFrame ['ds', 'y'].
     Validates chronological ordering, naivety, and count.
     """
+    set_last_observation_count(len(points))
     if len(points) < min_observations:
         raise HTTPException(
             status_code=422,
             detail=(
+                "Waiting for sufficient live Prometheus observations to fit Prophet. "
                 f"Insufficient Prometheus observations: found {len(points)}, "
                 f"at least {min_observations} required to fit Prophet."
             ),
@@ -402,97 +510,45 @@ def fit_prophet_and_forecast(
     Fits Prophet time-series model on input DataFrame and returns projected horizon.
     Clamps predictions to >= 0.0.
     """
+    set_is_fitting(True)
     try:
-        from prophet import Prophet
-    except ImportError as e:
-        raise HTTPException(
-            status_code=500, detail=f"Prophet library not installed on backend: {str(e)}"
-        ) from e
+        try:
+            from prophet import Prophet
+        except ImportError as e:
+            raise HTTPException(
+                status_code=500, detail=f"Prophet library not installed on backend: {str(e)}"
+            ) from e
 
-    np.random.seed(seed)
-    model = Prophet(
-        growth="linear",
-        yearly_seasonality=False,
-        weekly_seasonality=False,
-        daily_seasonality=False,
-        changepoint_prior_scale=0.05,
-        interval_width=0.95,
-    )
-
-    try:
-        model.fit(df)
-        future = model.make_future_dataframe(periods=horizon_steps, freq=freq, include_history=True)
-        fcst = model.predict(future)
-    except Exception as e:
-        logger.error(f"Prophet fitting/prediction failed: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Prophet model fitting error: {str(e)}"
-        ) from e
-
-    out_df = fcst[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
-    out_df["yhat"] = out_df["yhat"].clip(lower=0.0)
-    out_df["yhat_lower"] = out_df["yhat_lower"].clip(lower=0.0)
-    out_df["yhat_upper"] = out_df["yhat_upper"].clip(lower=0.0)
-
-    return out_df.reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Fallback CSV Loader
-# ---------------------------------------------------------------------------
-
-def load_static_forecast_fallback() -> pd.DataFrame:
-    """Reads static CSV forecast as fallback when live Prometheus is unavailable."""
-    path = Path(os.getenv("FORECAST_CSV_PATH", DEFAULT_FORECAST_CSV))
-    if not path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Static forecast fallback file not found: {path}",
-        )
-    try:
-        df = pd.read_csv(path)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to read static forecast CSV: {e}"
-        ) from e
-
-    if df.empty or "ds" not in df.columns or "yhat" not in df.columns:
-        raise HTTPException(
-            status_code=422, detail="Static forecast CSV empty or missing required columns ('ds', 'yhat')."
+        np.random.seed(seed)
+        model = Prophet(
+            growth="linear",
+            yearly_seasonality=False,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            changepoint_prior_scale=0.05,
+            interval_width=0.95,
         )
 
-    df["ds_dt"] = pd.to_datetime(df["ds"])
-    df["yhat"] = pd.to_numeric(df["yhat"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    if "yhat_lower" in df.columns:
-        df["yhat_lower"] = pd.to_numeric(df["yhat_lower"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    else:
-        df["yhat_lower"] = None
-    if "yhat_upper" in df.columns:
-        df["yhat_upper"] = pd.to_numeric(df["yhat_upper"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    else:
-        df["yhat_upper"] = None
+        try:
+            model.fit(df)
+            future = model.make_future_dataframe(periods=horizon_steps, freq=freq, include_history=True)
+            fcst = model.predict(future)
+        except Exception as e:
+            logger.error(f"Prophet fitting/prediction failed: {e}")
+            raise HTTPException(
+                status_code=500, detail=f"Prophet model fitting error: {str(e)}"
+            ) from e
 
-    return df.sort_values(by="ds_dt").reset_index(drop=True)
+        out_df = fcst[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+        out_df["yhat"] = out_df["yhat"].clip(lower=0.0)
+        out_df["yhat_lower"] = out_df["yhat_lower"].clip(lower=0.0)
+        out_df["yhat_upper"] = out_df["yhat_upper"].clip(lower=0.0)
 
-
-def load_static_metrics_fallback() -> pd.DataFrame:
-    """Reads static CSV metrics as fallback."""
-    path = Path(os.getenv("METRICS_CSV_PATH", DEFAULT_METRICS_CSV))
-    if not path.is_file():
-        raise HTTPException(
-            status_code=404, detail=f"Static metrics fallback file not found: {path}"
-        )
-    try:
-        df = pd.read_csv(path)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to read static metrics CSV: {e}"
-        ) from e
-    if df.empty or "timestamp_utc" not in df.columns or "http_work_rps" not in df.columns:
-        raise HTTPException(
-            status_code=422, detail="Static metrics CSV empty or missing required columns."
-        )
-    return df
+        set_last_fitting_timestamp(time.time())
+        set_last_observation_count(len(df))
+        return out_df.reset_index(drop=True)
+    finally:
+        set_is_fitting(False)
 
 
 # ---------------------------------------------------------------------------
@@ -503,10 +559,7 @@ def get_or_generate_forecast(force_refresh: bool = False) -> Tuple[pd.DataFrame,
     """
     Returns (forecast_dataframe, provenance, source_detail).
     Checks cache first unless force_refresh is True.
-    Attempts live Prometheus query and Prophet fitting.
-    If live Prometheus fails:
-      - Uses static CSV if ENABLE_STATIC_FALLBACK is True.
-      - Otherwise raises HTTPException.
+    Exclusively fits Prophet on live Prometheus observations.
     """
     ttl = int(os.getenv("FORECAST_CACHE_TTL_SECONDS", str(FORECAST_CACHE_TTL_SECONDS)))
     if not force_refresh and forecast_cache.is_valid(ttl):
@@ -530,7 +583,6 @@ def get_or_generate_forecast(force_refresh: bool = False) -> Tuple[pd.DataFrame,
         step = os.getenv("QUERY_STEP", QUERY_STEP)
         horizon = int(os.getenv("FORECAST_HORIZON_STEPS", str(FORECAST_HORIZON_STEPS)))
         seed = int(os.getenv("FORECAST_SEED", str(RANDOM_SEED)))
-        fallback_allowed = os.getenv("ENABLE_STATIC_FALLBACK", str(ENABLE_STATIC_FALLBACK)).lower() in ("true", "1", "yes")
 
         # Attempt live Prometheus path if URL configured
         if prom_url:
@@ -561,32 +613,17 @@ def get_or_generate_forecast(force_refresh: bool = False) -> Tuple[pd.DataFrame,
                 if force_refresh:
                     forecast_cache.clear()
                 logger.warning(f"Live Prometheus forecasting failed: {e.detail}")
-                if not fallback_allowed:
-                    raise e
-                logger.info("Static fallback enabled; falling back to static CSV forecast.")
+                raise e
             except Exception as e:
                 err_msg = str(e)
                 set_last_forecast_error(err_msg)
                 if force_refresh:
                     forecast_cache.clear()
                 logger.warning(f"Live Prometheus forecasting failed with error: {err_msg}")
-                if not fallback_allowed:
-                    raise HTTPException(status_code=500, detail=f"Forecasting error: {err_msg}") from e
-                logger.info("Static fallback enabled; falling back to static CSV forecast.")
+                raise HTTPException(status_code=500, detail=f"Forecasting error: {err_msg}") from e
 
-        # Fallback to static CSV
-        if fallback_allowed:
-            fcst_df = load_static_forecast_fallback()
-            provenance = "static_csv_fallback"
-            detail = f"CSV fallback: {Path(os.getenv('FORECAST_CSV_PATH', DEFAULT_FORECAST_CSV)).name}"
-            forecast_cache.update(fcst_df, provenance, detail)
-            return fcst_df, provenance, detail
-
-        # No Prometheus URL and no fallback allowed
-        err_detail = (
-            "Prometheus is not configured (PROMETHEUS_URL empty) and "
-            "ENABLE_STATIC_FALLBACK is false. Cannot generate forecast."
-        )
+        # No Prometheus URL configured
+        err_detail = "Prometheus is not configured (PROMETHEUS_URL empty). Live Prometheus observations are required to fit Prophet."
         set_last_forecast_error(err_detail)
         if force_refresh:
             forecast_cache.clear()
@@ -612,7 +649,6 @@ def get_health():
         except Exception:
             prom_connected = False
 
-    fallback_enabled = os.getenv("ENABLE_STATIC_FALLBACK", str(ENABLE_STATIC_FALLBACK)).lower() in ("true", "1", "yes")
     auto_enabled = os.getenv("ENABLE_AUTO_REFRESH", str(ENABLE_AUTO_REFRESH)).lower() in ("true", "1", "yes")
     refresh_sec = float(os.getenv("REFRESH_INTERVAL_SECONDS", str(REFRESH_INTERVAL_SECONDS)))
     task_running = _refresh_task is not None and not _refresh_task.done()
@@ -622,13 +658,16 @@ def get_health():
     age = max(0.0, round(now - last_ts, 1)) if last_ts > 0 else None
     is_fresh = bool(age is not None and age < 45.0)
 
+    last_fit_ts = get_last_fitting_timestamp()
+    obs_cnt = get_last_observation_count()
+    model_stat = get_model_status()
+
     return HealthResponse(
         status="ok",
         service="predictive-k8s-autoscaling-backend",
         version="1.2.0",
         prometheus_configured=bool(prom_url),
         prometheus_connected=prom_connected,
-        static_fallback_enabled=fallback_enabled,
         auto_refresh_enabled=auto_enabled,
         refresh_interval_seconds=refresh_sec,
         background_task_running=task_running,
@@ -636,6 +675,10 @@ def get_health():
         prediction_age_seconds=age,
         is_fresh=is_fresh,
         last_forecast_error=get_last_forecast_error(),
+        last_fitting_timestamp=round(last_fit_ts, 2) if last_fit_ts else None,
+        valid_historical_observations=obs_cnt,
+        model_status=model_stat,
+        prediction_source="Live Prophet only",
     )
 
 
@@ -646,7 +689,7 @@ def get_forecast(
 ):
     """
     Returns the Prophet workload forecast.
-    Provenance indicates 'live_prometheus' or 'static_csv_fallback'.
+    Provenance indicates 'live_prometheus' or 'none'.
     """
     fcst_df, provenance, source_detail = get_or_generate_forecast(force_refresh=force_refresh)
 
@@ -657,7 +700,7 @@ def get_forecast(
     for _, row in fcst_df.iterrows():
         items.append(
             ForecastItem(
-                ds=str(row["ds"]),
+                ds=to_utc_iso(row["ds"]),
                 yhat=round(float(row["yhat"]), 4),
                 yhat_lower=round(float(row["yhat_lower"]), 4) if pd.notnull(row.get("yhat_lower")) else None,
                 yhat_upper=round(float(row["yhat_upper"]), 4) if pd.notnull(row.get("yhat_upper")) else None,
@@ -669,10 +712,14 @@ def get_forecast(
         for _, h_row in forecast_cache.history_df.tail(limit or 50).iterrows():
             history_items.append(
                 HistoricalItem(
-                    ds=str(h_row["ds"]),
+                    ds=to_utc_iso(h_row["ds"]),
                     actual_rps=round(max(0.0, float(h_row["y"])), 4),
                 )
             )
+
+    last_fit_ts = get_last_fitting_timestamp()
+    obs_cnt = get_last_observation_count()
+    model_stat = get_model_status()
 
     return ForecastResponse(
         provenance=provenance,
@@ -682,6 +729,10 @@ def get_forecast(
         history=history_items,
         generated_at_epoch=round(forecast_cache.timestamp, 3),
         horizon_steps=len(items),
+        last_fitting_timestamp=round(last_fit_ts, 2) if last_fit_ts else None,
+        valid_historical_observations=obs_cnt,
+        model_status=model_stat,
+        prediction_source="Live Prophet only",
     )
 
 
@@ -689,7 +740,6 @@ def get_forecast(
 def get_metrics():
     """
     Returns the latest observed request-rate measurement and forecast summary.
-    Provenance clearly distinguishes live Prometheus measurements from static CSV data.
     """
     observed_obj: Optional[ObservedMetrics] = None
     forecast_obj: Optional[ForecastSummary] = None
@@ -698,7 +748,6 @@ def get_metrics():
     # Attempt latest observed metric
     prom_url = get_prometheus_url()
     prom_query = os.getenv("PROMETHEUS_QUERY", PROMETHEUS_QUERY)
-    fallback_allowed = os.getenv("ENABLE_STATIC_FALLBACK", str(ENABLE_STATIC_FALLBACK)).lower() in ("true", "1", "yes")
 
     if prom_url:
         try:
@@ -728,26 +777,6 @@ def get_metrics():
         except Exception as e:
             logger.warning(f"Failed to query instant metric from Prometheus: {e}")
 
-    # Fallback to static metrics CSV if observed is not populated and fallback allowed
-    if observed_obj is None and fallback_allowed:
-        try:
-            metrics_df = load_static_metrics_fallback()
-            latest_m = metrics_df.iloc[-1]
-            observed_obj = ObservedMetrics(
-                timestamp_utc=str(latest_m["timestamp_utc"]),
-                epoch_timestamp=float(latest_m.get("epoch_timestamp", 0.0)),
-                collection_status=str(latest_m.get("collection_status", "unknown")),
-                http_work_rps=round(float(latest_m["http_work_rps"]), 4),
-                http_rps=round(float(latest_m["http_rps"]), 4) if "http_rps" in latest_m and pd.notnull(latest_m["http_rps"]) else None,
-                cpu_usage_cores=round(float(latest_m["cpu_usage_cores"]), 4) if "cpu_usage_cores" in latest_m and pd.notnull(latest_m["cpu_usage_cores"]) else None,
-                pod_count=int(latest_m["pod_count"]) if "pod_count" in latest_m and pd.notnull(latest_m["pod_count"]) else None,
-                hpa_current_replicas=int(latest_m["hpa_current_replicas"]) if "hpa_current_replicas" in latest_m and pd.notnull(latest_m["hpa_current_replicas"]) else None,
-                hpa_desired_replicas=int(latest_m["hpa_desired_replicas"]) if "hpa_desired_replicas" in latest_m and pd.notnull(latest_m["hpa_desired_replicas"]) else None,
-            )
-            provenance = "static_csv_fallback"
-        except Exception as e:
-            logger.warning(f"Could not load fallback metrics CSV: {e}")
-
     # Load latest forecast prediction only if valid, cached, and fresh (<45s)
     try:
         fcst_df, fcst_prov, _ = get_or_generate_forecast(force_refresh=False)
@@ -763,7 +792,7 @@ def get_metrics():
         if is_pred_fresh and fcst_df is not None and not fcst_df.empty:
             latest_f = fcst_df.iloc[-1]
             forecast_obj = ForecastSummary(
-                ds=str(latest_f["ds"]),
+                ds=to_utc_iso(latest_f["ds"]),
                 yhat=round(float(latest_f["yhat"]), 4),
                 yhat_lower=round(float(latest_f["yhat_lower"]), 4) if pd.notnull(latest_f.get("yhat_lower")) else None,
                 yhat_upper=round(float(latest_f["yhat_upper"]), 4) if pd.notnull(latest_f.get("yhat_upper")) else None,
@@ -776,7 +805,7 @@ def get_metrics():
         forecast_obj = None
 
     if observed_obj is None and forecast_obj is None:
-        if not fallback_allowed and not prom_url:
+        if not prom_url:
             raise HTTPException(
                 status_code=503,
                 detail="Neither observed telemetry nor forecast projections could be retrieved.",
@@ -789,15 +818,20 @@ def get_metrics():
         )
         provenance = "live_prometheus" if prom_url else "none"
 
+    last_fit_ts = get_last_fitting_timestamp()
+    obs_cnt = get_last_observation_count()
+    model_stat = get_model_status()
+
     return MetricsResponse(
         status="ok",
         observed=observed_obj,
         forecast=forecast_obj,
         provenance=provenance,
-        note=(
-            "Provenance indicates whether observed telemetry came from 'live_prometheus' "
-            "or 'static_csv_fallback'."
-        ),
+        note="Live telemetry from Prometheus.",
+        last_fitting_timestamp=round(last_fit_ts, 2) if last_fit_ts else None,
+        valid_historical_observations=obs_cnt,
+        model_status=model_stat,
+        prediction_source="Live Prophet only",
     )
 
 
@@ -822,9 +856,13 @@ def refresh_prediction(
             set_last_forecast_error(None)
         except HTTPException as e:
             set_last_forecast_error(e.detail)
+            PREDICTED_LOAD_GAUGE.set(0.0)
+            PREDICTION_PROVENANCE_GAUGE.set(0.0)
             raise
         except Exception as e:
             set_last_forecast_error(str(e))
+            PREDICTED_LOAD_GAUGE.set(0.0)
+            PREDICTION_PROVENANCE_GAUGE.set(0.0)
             raise
 
         if len(fcst_df) == 0:
@@ -835,16 +873,16 @@ def refresh_prediction(
 
         if aggregation == "max":
             predicted_val = float(window_df["yhat"].max())
-            target_timestamp = str(window_df.loc[window_df["yhat"].idxmax(), "ds"])
+            target_timestamp = to_utc_iso(window_df.loc[window_df["yhat"].idxmax(), "ds"])
             calc_method = f"maximum predicted load over next {available_steps} forecast steps"
         elif aggregation == "mean":
             predicted_val = float(window_df["yhat"].mean())
-            target_timestamp = str(window_df.iloc[-1]["ds"])
+            target_timestamp = to_utc_iso(window_df.iloc[-1]["ds"])
             calc_method = f"mean predicted load over next {available_steps} forecast steps"
         else:  # "point"
             target_row = window_df.iloc[-1]
             predicted_val = float(target_row["yhat"])
-            target_timestamp = str(target_row["ds"])
+            target_timestamp = to_utc_iso(target_row["ds"])
             calc_method = f"point prediction at horizon step {available_steps}"
 
         predicted_val = max(0.0, round(predicted_val, 4))
@@ -957,7 +995,7 @@ def get_predicted_load(
     by a future KEDA external metric scaler.
 
     Provenance specifies whether the prediction was generated from 'live_prometheus'
-    or 'static_csv_fallback'.
+    or 'none'.
     """
     predicted_val, provenance, target_timestamp, calc_method, available_steps = refresh_prediction(
         horizon_steps=horizon_steps,
@@ -1064,6 +1102,10 @@ class CpuHpaStatusResponse(BaseModel):
     max_replicas: int = 5
     conditions: List[HpaCondition] = Field(default_factory=list)
     scaling_events: List[HpaScalingEvent] = Field(default_factory=list)
+    last_fitting_timestamp: Optional[float] = None
+    valid_historical_observations: int = 0
+    model_status: str = "Waiting for data"
+    prediction_source: str = "Live Prophet only"
     config: CpuHpaConfig
 
 
@@ -1098,6 +1140,10 @@ class AutoscalingStatusResponse(BaseModel):
     active_controller_name: str = "KEDA Predictive Autoscaler (target-app-predictive-scaledobject)"
     conditions: List[HpaCondition] = Field(default_factory=list)
     scaling_events: List[HpaScalingEvent] = Field(default_factory=list)
+    last_fitting_timestamp: Optional[float] = None
+    valid_historical_observations: int = 0
+    model_status: str = "Waiting for data"
+    prediction_source: str = "Live Prophet only"
 
 
 class WorkloadStartRequest(BaseModel):
@@ -1417,21 +1463,6 @@ def get_kubernetes_status():
         except Exception as e:
             logger.warning(f"Failed to query Prometheus for kubernetes status: {e}")
 
-    # Fallback to static metrics CSV if Prometheus produced no metrics
-    if provenance != "live_prometheus":
-        try:
-            df = load_static_metrics_fallback()
-            latest = df.iloc[-1]
-            current_reps = int(latest.get("pod_count", 1))
-            desired_reps = int(latest.get("hpa_desired_replicas", current_reps))
-            avail_reps = int(latest.get("deployment_available_replicas", current_reps))
-            cpu_cores = round(float(latest.get("cpu_usage_cores", 0.0)), 4)
-            mem_mb = round(float(latest.get("memory_working_set_mb", 0.0)), 2)
-            collection_status = str(latest.get("collection_status", "fallback"))
-            provenance = "static_csv_fallback"
-        except Exception:
-            pass
-
     # Build pod objects
     pods = []
     # Attempt to query live pods via kubectl if available
@@ -1513,11 +1544,13 @@ def get_autoscaling_status():
     last_ts = PREDICTION_TIMESTAMP_GAUGE._value.get()
     current_load = PREDICTED_LOAD_GAUGE._value.get()
     prov_val = PREDICTION_PROVENANCE_GAUGE._value.get()
-    current_prov = "live_prometheus" if prov_val == 1.0 else "static_csv_fallback"
+    current_prov = "live_prometheus" if prov_val == 1.0 else "none"
 
     current_error = get_last_forecast_error()
     is_insufficient = current_error is not None and (
-        "insufficient" in current_error.lower() or "at least 5" in current_error.lower()
+        "insufficient" in current_error.lower()
+        or "waiting for sufficient" in current_error.lower()
+        or "at least 5" in current_error.lower()
     )
 
     # If backend gauges are at 0 and NO forecast error has occurred, try reading from Prometheus
@@ -1606,6 +1639,10 @@ def get_autoscaling_status():
     if not keda_events:
         keda_events = get_kubernetes_scaling_events(object_filter="keda")
 
+    last_fit_ts = get_last_fitting_timestamp()
+    obs_cnt = get_last_observation_count()
+    model_stat = get_model_status()
+
     return AutoscalingStatusResponse(
         scaledobject_name=manifest_cfg.get("name", "target-app-predictive-scaledobject"),
         hpa_name=hpa_name,
@@ -1637,6 +1674,10 @@ def get_autoscaling_status():
         active_controller_name=ctrl_name,
         conditions=keda_conditions,
         scaling_events=keda_events,
+        last_fitting_timestamp=round(last_fit_ts, 2) if last_fit_ts else None,
+        valid_historical_observations=obs_cnt,
+        model_status=model_stat,
+        prediction_source="Live Prophet only",
     )
 
 
@@ -1870,11 +1911,7 @@ def get_experiment_comparison(
     across all five experimental workload profiles.
     By default queries clean experiments/results/ directory to start with a clean research comparison.
     """
-    if source.lower() == "historical":
-        exp_dir = BASE_DIR / "experiments"
-    else:
-        exp_dir = BASE_DIR / "experiments" / "results"
-        exp_dir.mkdir(parents=True, exist_ok=True)
+    exp_dir = get_experiments_dir(source)
 
     comparisons = {}
 
@@ -1907,6 +1944,153 @@ def get_experiment_comparison(
         available_profiles=list(PROFILES_METADATA.keys()),
         comparisons=comparisons,
     )
+
+
+@app.get("/api/experiments/download/{autoscaler}/{profile}")
+def download_experiment_csv(
+    autoscaler: str,
+    profile: str,
+    source: str = Query("results", description="Dataset source directory: 'results' (default: experiments/results) or 'historical' (experiments/)"),
+):
+    """
+    Downloads an individual genuine experiment dataset as CSV.
+    Preserves all original measurement headers, timestamps, and metric values without modification.
+    Rejects requests when no genuine experiment data has been collected.
+    """
+    allowed_autoscalers = {"hpa", "predictive", "keda"}
+    allowed_profiles = set(PROFILES_METADATA.keys())
+
+    auto_lower = autoscaler.lower()
+    prof_lower = profile.lower()
+
+    if auto_lower not in allowed_autoscalers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid autoscaler '{autoscaler}'. Must be 'hpa' or 'predictive'.",
+        )
+    if prof_lower not in allowed_profiles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid workload profile '{profile}'. Allowed profiles: {', '.join(sorted(allowed_profiles))}.",
+        )
+
+    exp_dir = get_experiments_dir(source)
+
+    candidates = []
+    if auto_lower == "hpa":
+        candidates.append(exp_dir / f"hpa_{prof_lower}.csv")
+    else:
+        candidates.append(exp_dir / f"predictive_{prof_lower}.csv")
+        candidates.append(exp_dir / f"keda_{prof_lower}.csv")
+
+    target_file = None
+    for c in candidates:
+        if c.is_file() and c.stat().st_size > 0:
+            target_file = c
+            break
+
+    if target_file is None:
+        autoscaler_label = "CPU HPA" if auto_lower == "hpa" else "Predictive KEDA"
+        raise HTTPException(
+            status_code=404,
+            detail=f"No completed experiment results available for {autoscaler_label} on '{prof_lower}' workload profile. Run an experiment to collect genuine results.",
+        )
+
+    download_filename = target_file.name
+    return FileResponse(
+        path=str(target_file),
+        filename=download_filename,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{download_filename}"'},
+    )
+
+
+@app.get("/api/experiments/download-all")
+def download_all_experiments_zip(
+    source: str = Query("results", description="Dataset source directory: 'results' (default: experiments/results) or 'historical' (experiments/)"),
+):
+    """
+    Downloads all completed genuine experiment CSV files as a zip archive.
+    Preserves original timestamps and measurements. Does not generate mock or empty data.
+    """
+    exp_dir = get_experiments_dir(source)
+
+    if not exp_dir.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail="Experiments directory does not exist or has no results.",
+        )
+
+    csv_files = []
+    for p in exp_dir.glob("*.csv"):
+        if (p.name.startswith("hpa_") or p.name.startswith("predictive_") or p.name.startswith("keda_")) and p.stat().st_size > 0:
+            csv_files.append(p)
+
+    if not csv_files:
+        raise HTTPException(
+            status_code=404,
+            detail="No completed experiment results available to download. Run an experiment first to collect genuine research data.",
+        )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(csv_files):
+            zf.write(f, arcname=f.name)
+    buf.seek(0)
+
+    zip_filename = f"all_completed_experiments_{source}_{int(time.time())}.zip"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
+    )
+
+
+@app.get("/api/experiments/files")
+def list_experiment_files(
+    source: str = Query("results", description="Dataset source directory: 'results' (default: experiments/results) or 'historical' (experiments/)"),
+):
+    """
+    Returns the collection status of genuine experiment CSV files across all workload profiles.
+    Used by the dashboard to show downloadable datasets and indicate awaiting states.
+    """
+    exp_dir = get_experiments_dir(source)
+
+    profiles_status = {}
+    total_completed = 0
+
+    for profile in PROFILES_METADATA.keys():
+        hpa_file = exp_dir / f"hpa_{profile}.csv"
+        pred_file = exp_dir / f"predictive_{profile}.csv"
+        if not (pred_file.is_file() and pred_file.stat().st_size > 0):
+            pred_file = exp_dir / f"keda_{profile}.csv"
+
+        has_hpa = hpa_file.is_file() and hpa_file.stat().st_size > 0
+        has_pred = pred_file.is_file() and pred_file.stat().st_size > 0
+
+        hpa_bytes = hpa_file.stat().st_size if has_hpa else 0
+        pred_bytes = pred_file.stat().st_size if has_pred else 0
+
+        if has_hpa:
+            total_completed += 1
+        if has_pred:
+            total_completed += 1
+
+        profiles_status[profile] = {
+            "hpa": has_hpa,
+            "hpa_filename": hpa_file.name if has_hpa else None,
+            "hpa_size_bytes": hpa_bytes,
+            "predictive": has_pred,
+            "predictive_filename": pred_file.name if has_pred else None,
+            "predictive_size_bytes": pred_bytes,
+        }
+
+    return {
+        "source": source,
+        "directory": str(exp_dir.name),
+        "total_completed": total_completed,
+        "profiles": profiles_status,
+    }
 
 
 @app.get("/api/workload/status", response_model=WorkloadStatusResponse)

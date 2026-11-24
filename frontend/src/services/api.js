@@ -79,10 +79,31 @@ export const api = {
     return res.data;
   },
 
-  // Experiment Comparison
+  // Experiment Comparison & CSV Downloads
   getExperimentComparison: async (source = 'results') => {
     const res = await client.get(`/api/experiments/comparison?source=${encodeURIComponent(source)}`);
     return res.data;
+  },
+
+  getExperimentFiles: async (source = 'results') => {
+    const res = await client.get(`/api/experiments/files?source=${encodeURIComponent(source)}`);
+    return res.data;
+  },
+
+  downloadExperimentCsv: async (autoscaler, profile, source = 'results') => {
+    const res = await client.get(
+      `/api/experiments/download/${encodeURIComponent(autoscaler)}/${encodeURIComponent(profile)}?source=${encodeURIComponent(source)}`,
+      { responseType: 'blob' }
+    );
+    return res;
+  },
+
+  downloadAllExperimentsZip: async (source = 'results') => {
+    const res = await client.get(
+      `/api/experiments/download-all?source=${encodeURIComponent(source)}`,
+      { responseType: 'blob' }
+    );
+    return res;
   },
 };
 

@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import MetricCard from '../components/MetricCard';
 import StatusBadge from '../components/StatusBadge';
+import { formatToIstTime } from '../utils/timezone';
 
 export default function CpuHpa({ cpuHpaStatus, k8sStatus }) {
   const isApplied = cpuHpaStatus?.is_applied ?? false;
@@ -237,7 +238,7 @@ export default function CpuHpa({ cpuHpaStatus, k8sStatus }) {
                   <div className="text-slate-400 text-[11px] font-sans truncate">{evt.message}</div>
                 </div>
                 <span className="text-slate-400 text-[10px] shrink-0 font-mono">
-                  {evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString() : 'Recent'}
+                  {evt.timestamp ? formatToIstTime(evt.timestamp) : 'Recent'}
                 </span>
               </div>
             ))}

@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import MetricCard from '../components/MetricCard';
 import StatusBadge from '../components/StatusBadge';
+import { formatToIstTime, formatToIstChartTime } from '../utils/timezone';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -62,7 +63,10 @@ export default function Overview({
   let predictedVariant = 'purple';
 
   const isInsufficient = Boolean(
-    activeError && (activeError.toLowerCase().includes('insufficient') || activeError.toLowerCase().includes('at least 5'))
+    activeError &&
+      (activeError.toLowerCase().includes('insufficient') ||
+        activeError.toLowerCase().includes('waiting for sufficient') ||
+        activeError.toLowerCase().includes('at least 5'))
   );
   const isWaiting =
     forecastStatus === 'waiting_for_data' ||
@@ -85,10 +89,10 @@ export default function Overview({
     predictedSubtitle = (
       <span
         className="flex items-center gap-1.5 text-amber-400 text-xs font-medium"
-        title={activeError || 'Awaiting 5 traffic samples on /api/work'}
+        title="Waiting for sufficient live Prometheus observations to fit Prophet."
       >
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 animate-pulse" />
-        <span>Waiting for live data</span>
+        <span>Waiting for data</span>
       </span>
     );
     predictedVariant = 'amber';
@@ -113,7 +117,7 @@ export default function Overview({
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400" />
         <span className="text-emerald-400 font-medium">Updated {ageStr}</span>
         <span className="text-slate-600">&bull;</span>
-        <span className="font-mono text-slate-400">{provenance}</span>
+        <span className="font-mono text-cyan-400">Live Prophet only</span>
       </span>
     );
     predictedVariant = 'cyan';
@@ -121,7 +125,7 @@ export default function Overview({
     predictedValue = '--';
     predictedUnit = 'req/s';
     predictedBadge = null;
-    predictedSubtitle = activeError || 'Waiting for live data';
+    predictedSubtitle = 'Waiting for sufficient live Prometheus observations to fit Prophet.';
     predictedVariant = 'amber';
   }
 
@@ -154,16 +158,28 @@ export default function Overview({
       ? Math.round((memMb / (128 * currentReplicas)) * 100)
       : 0;
 
+  // Live Prophet Model & Fitting Metadata
+  const modelStatus = autoscalingStatus?.model_status || (isFresh ? 'Forecasting' : 'Waiting for data');
+  const validObservations =
+    autoscalingStatus?.valid_historical_observations ??
+    forecastData?.valid_historical_observations ??
+    (forecastData?.history ? forecastData.history.length : 0);
+  const lastFittingTimeStr = autoscalingStatus?.last_fitting_timestamp
+    ? formatToIstTime(autoscalingStatus.last_fitting_timestamp)
+    : forecastData?.last_fitting_timestamp
+    ? formatToIstTime(forecastData.last_fitting_timestamp)
+    : '--';
+  const lastPredictionTimeStr = autoscalingStatus?.last_prediction_timestamp && autoscalingStatus.last_prediction_timestamp > 0
+    ? formatToIstTime(autoscalingStatus.last_prediction_timestamp)
+    : '--';
+
   // Format forecast points for the mini-chart (only show if forecast is fresh and active)
   const points = (isFresh && forecastData) ? (forecastData?.data || forecastData?.forecast || []) : [];
   const miniChartData = points.slice(0, 30).map((pt, idx) => {
     let timeLabel = `+${idx * 15}s`;
     const tsStr = pt.ds || pt.timestamp;
     if (tsStr) {
-      const d = new Date(tsStr);
-      if (!isNaN(d.getTime())) {
-        timeLabel = d.toLocaleTimeString([], { minute: '2-digit', second: '2-digit' });
-      }
+      timeLabel = formatToIstChartTime(tsStr);
     }
     return {
       time: timeLabel,
@@ -350,11 +366,11 @@ export default function Overview({
                 <span className="font-semibold text-slate-200 mb-1">
                   {forecastStatus === 'stale'
                     ? 'Forecast Stale (Validity Gate Closed)'
-                    : 'Awaiting Application Traffic'}
+                    : 'Waiting for sufficient live Prometheus observations to fit Prophet.'}
                 </span>
                 <span className="max-w-md text-slate-400 leading-relaxed">
                   {activeError ||
-                    'Prometheus has not yet observed 5 consecutive /api/work requests needed to fit Prophet. Launch a profile in the Workload tab to begin real-time forecasting.'}
+                    'Waiting for sufficient live Prometheus observations to fit Prophet. At least 5 live observations on /api/work are required to fit the time-series model.'}
                 </span>
               </div>
             )}
@@ -387,12 +403,42 @@ export default function Overview({
               />
             </div>
 
-            <div className="space-y-3">
+            <div className="space-y-2.5">
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60">
-                  <span className="text-slate-400 block mb-0.5">Scale Target</span>
-                  <span className="font-mono text-slate-200 font-semibold">
-                    {autoscalingStatus?.metric_threshold || 10} RPS/pod
+                  <span className="text-slate-400 block mb-0.5">Model Status</span>
+                  <span className={`font-semibold ${modelStatus === 'Forecasting' ? 'text-cyan-400' : modelStatus === 'Training/Fitting' ? 'text-indigo-400 animate-pulse' : 'text-amber-400'}`}>
+                    {modelStatus}
+                  </span>
+                </div>
+                <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60">
+                  <span className="text-slate-400 block mb-0.5">Prediction Source</span>
+                  <span className="font-mono text-emerald-400 font-semibold">
+                    Live Prophet only
+                  </span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60">
+                  <span className="text-slate-400 block mb-0.5">Last Model Fit</span>
+                  <span className="font-mono text-slate-200">
+                    {lastFittingTimeStr}
+                  </span>
+                </div>
+                <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60">
+                  <span className="text-slate-400 block mb-0.5">Last Prediction</span>
+                  <span className="font-mono text-slate-200">
+                    {lastPredictionTimeStr}
+                  </span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60">
+                  <span className="text-slate-400 block mb-0.5">Observations</span>
+                  <span className="font-mono text-cyan-400 font-semibold">
+                    {validObservations > 0 ? `${validObservations} samples` : '--'}
                   </span>
                 </div>
                 <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60">
@@ -412,10 +458,9 @@ export default function Overview({
               </div>
 
               <div className="p-2.5 bg-slate-950/40 rounded-lg border border-slate-800/60 text-xs flex items-center justify-between">
-                <span className="text-slate-400">Failover Mode</span>
-                <span className="font-mono text-slate-200">
-                  Fallback to {autoscalingStatus?.fallback_replicas || 2} pods after{' '}
-                  {autoscalingStatus?.fallback_threshold || 3} fails
+                <span className="text-slate-400">Scale Target</span>
+                <span className="font-mono text-slate-200 font-semibold">
+                  {autoscalingStatus?.metric_threshold || 10} RPS/pod &bull; min: {k8sStatus?.min_replicas || 1}, max: {maxReplicas}
                 </span>
               </div>
 

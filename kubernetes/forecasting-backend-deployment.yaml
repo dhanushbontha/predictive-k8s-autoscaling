@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: forecasting-backend
-          image: predictive-forecasting-backend:1.2
+          image: predictive-forecasting-backend:2.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -40,12 +40,6 @@ spec:
               value: "30"
             - name: PREDICTION_HORIZON_STEPS
               value: "5"
-            - name: ENABLE_STATIC_FALLBACK
-              value: "true"
-            - name: FORECAST_CSV_PATH
-              value: "/app/data/forecast_periodic.csv"
-            - name: METRICS_CSV_PATH
-              value: "/app/data/hpa_periodic.csv"
           resources:
             requests:
               cpu: 250m

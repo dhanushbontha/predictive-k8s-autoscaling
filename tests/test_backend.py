@@ -60,35 +60,6 @@ def clear_cache():
     PREDICTION_TIMESTAMP_GAUGE.set(0.0)
 
 
-@pytest.fixture
-def valid_forecast_csv(tmp_path):
-    csv_file = tmp_path / "valid_forecast.csv"
-    content = (
-        "ds,yhat,yhat_lower,yhat_upper\n"
-        "2026-10-29 10:35:44.620585,24.2565,20.4413,28.5056\n"
-        "2026-10-29 10:35:46.620585,24.4660,20.4755,28.5081\n"
-        "2026-10-29 10:35:48.620585,24.6754,20.7164,29.1028\n"
-        "2026-10-29 10:35:50.620585,24.8849,20.6522,28.9962\n"
-        "2026-10-29 10:35:52.620585,25.0944,20.9717,29.4902\n"
-    )
-    csv_file.write_text(content, encoding="utf-8")
-    return str(csv_file)
-
-
-@pytest.fixture
-def valid_metrics_csv(tmp_path):
-    csv_file = tmp_path / "valid_metrics.csv"
-    content = (
-        "timestamp_utc,epoch_timestamp,collection_status,cpu_usage_cores,memory_working_set_bytes,"
-        "memory_working_set_mb,pod_count,deployment_replicas,deployment_available_replicas,"
-        "hpa_current_replicas,hpa_desired_replicas,http_requests_total,http_requests_work_total,"
-        "http_rps,http_work_rps,http_error_rps,latency_p50_seconds,latency_p95_seconds,latency_p99_seconds\n"
-        "2026-10-29T10:35:40.000000+00:00,1793270140.0,ok,0.152,42344448,40.38,2,2,2,2,2,27263,20836,19.5,18.9,0,0.015,0.035,0.045\n"
-    )
-    csv_file.write_text(content, encoding="utf-8")
-    return str(csv_file)
-
-
 # ---------------------------------------------------------------------------
 # Unit tests: Health check
 # ---------------------------------------------------------------------------
@@ -101,7 +72,7 @@ def test_health_endpoint():
     assert data["service"] == "predictive-k8s-autoscaling-backend"
     assert "version" in data
     assert "prometheus_configured" in data
-    assert "static_fallback_enabled" in data
+    assert "static_fallback_enabled" not in data
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +148,6 @@ def test_fetch_prometheus_timeout():
 
 def test_live_prometheus_forecast_success(monkeypatch):
     monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
-    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
 
     # Generate 10 mock points
     mock_values = [[1700000000.0 + i * 5, str(10.0 + i * 0.5)] for i in range(10)]
@@ -209,23 +179,8 @@ def test_live_prometheus_forecast_success(monkeypatch):
         assert cache_resp.json()["predicted_load"] >= 0.0
 
 
-def test_live_prometheus_failure_with_fallback(valid_forecast_csv, monkeypatch):
+def test_live_prometheus_failure_raises_error(monkeypatch):
     monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
-    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "true")
-    monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
-
-    import requests
-    with patch("requests.get", side_effect=requests.exceptions.ConnectionError("Connection refused")):
-        response = client.get("/api/forecast?limit=2")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["provenance"] == "static_csv_fallback"
-        assert len(data["data"]) == 2
-
-
-def test_live_prometheus_failure_without_fallback_raises_error(monkeypatch):
-    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
-    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
 
     import requests
     with patch("requests.get", side_effect=requests.exceptions.ConnectionError("Connection refused")):
@@ -236,7 +191,6 @@ def test_live_prometheus_failure_without_fallback_raises_error(monkeypatch):
 
 def test_metrics_endpoint_with_live_instant_query(monkeypatch):
     monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
-    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
 
     # Mock range query for forecast
     mock_range_values = [[1700000000.0 + i * 5, str(10.0 + i)] for i in range(10)]
@@ -298,7 +252,6 @@ def test_metrics_endpoint_returns_prometheus_format():
 
 def test_gauges_updated_on_live_predicted_load(monkeypatch):
     monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
-    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
 
     mock_values = [[1700000000.0 + i * 5, str(10.0 + i)] for i in range(10)]
     mock_payload = {
@@ -333,28 +286,6 @@ def test_gauges_updated_on_live_predicted_load(monkeypatch):
         assert f"predicted_http_work_rps {predicted_val}" in content
         # prediction_provenance should be 1.0 for live_prometheus
         assert "prediction_provenance 1.0" in content
-
-
-def test_gauges_updated_on_static_fallback_predicted_load(valid_forecast_csv, monkeypatch):
-    monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
-    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "true")
-    monkeypatch.setenv("FORECAST_CSV_PATH", valid_forecast_csv)
-
-    import requests
-    with patch("requests.get", side_effect=requests.exceptions.ConnectionError("Connection refused")):
-        response = client.get("/api/predicted-load?horizon_steps=1&aggregation=point")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["provenance"] == "static_csv_fallback"
-        predicted_val = data["predicted_load"]
-
-        # Scrape /metrics and verify gauge values
-        metrics_resp = client.get("/metrics")
-        assert metrics_resp.status_code == 200
-        content = metrics_resp.text
-        assert f"predicted_http_work_rps {predicted_val}" in content
-        # prediction_provenance should be 0.0 for static_csv_fallback
-        assert "prediction_provenance 0.0" in content
 
 
 def test_scraping_metrics_endpoint_does_not_call_prometheus(monkeypatch):
@@ -399,25 +330,6 @@ def test_refresh_prediction_updates_gauges_live():
         # Verify gauges
         assert PREDICTED_LOAD_GAUGE._value.get() == 22.8
         assert PREDICTION_PROVENANCE_GAUGE._value.get() == 1.0
-
-
-def test_refresh_prediction_updates_gauges_fallback():
-    mock_df = pd.DataFrame(
-        {
-            "ds": ["2026-10-29 12:00:00"],
-            "yhat": [8.5],
-            "yhat_lower": [5.0],
-            "yhat_upper": [11.0],
-        }
-    )
-    with patch("backend.main.get_or_generate_forecast", return_value=(mock_df, "static_csv_fallback", "fallback detail")):
-        val, prov, ts, method, steps = refresh_prediction(horizon_steps=1, aggregation="point", force_refresh=True)
-        assert val == 8.5
-        assert prov == "static_csv_fallback"
-
-        # Verify gauges
-        assert PREDICTED_LOAD_GAUGE._value.get() == 8.5
-        assert PREDICTION_PROVENANCE_GAUGE._value.get() == 0.0
 
 
 def test_refresh_prediction_error_handling_no_fallback():
@@ -747,17 +659,19 @@ def test_kubernetes_status_endpoint():
 
 
 def test_autoscaling_status_endpoint():
-    PREDICTION_TIMESTAMP_GAUGE.set(time.time())
-    PREDICTED_LOAD_GAUGE.set(18.5)
-    response = client.get("/api/autoscaling/status")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["scaledobject_name"] == "target-app-predictive-scaledobject"
-    assert data["metric_name"] == "predicted_http_work_rps"
-    assert data["metric_threshold"] == 10.0
-    assert data["current_predicted_load"] == 18.5
-    assert data["is_fresh"] is True
-    assert data["scaledobject_state"] == "Active"
+    with patch("backend.main.get_keda_scaledobject_live_status", return_value={"ready": True, "active": True, "fallback": False, "hpa_name": "keda-hpa-target-app-predictive-scaledobject", "failures": 0}):
+        PREDICTION_TIMESTAMP_GAUGE.set(time.time())
+        PREDICTED_LOAD_GAUGE.set(18.5)
+        response = client.get("/api/autoscaling/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["scaledobject_name"] == "target-app-predictive-scaledobject"
+        assert data["metric_name"] == "predicted_http_work_rps"
+        assert data["metric_threshold"] == 10.0
+        assert data["current_predicted_load"] == 18.5
+        assert data["is_fresh"] is True
+        assert data["scaledobject_state"] == "Active"
+        assert data["prediction_source"] == "Live Prophet only"
 
 
 def test_experiment_comparison_endpoint():
@@ -810,7 +724,6 @@ def test_failed_forecast_clears_cache_and_sets_error(monkeypatch):
     """
     from fastapi import HTTPException
     monkeypatch.setenv("PROMETHEUS_URL", "http://fake-prom:9090")
-    monkeypatch.setenv("ENABLE_STATIC_FALLBACK", "false")
 
     # Populate cache first with dummy data
     dummy_df = pd.DataFrame({"ds": ["2026-01-01 00:00:00"], "yhat": [26.1], "yhat_lower": [20.0], "yhat_upper": [30.0]})
@@ -860,7 +773,7 @@ def test_metrics_endpoint_withholds_stale_forecast():
     # Simulate an expired timestamp (>45s ago)
     PREDICTION_TIMESTAMP_GAUGE.set(time.time() - 60.0)
 
-    with patch.dict(os.environ, {"ENABLE_STATIC_FALLBACK": "false", "PROMETHEUS_URL": ""}):
+    with patch.dict(os.environ, {"PROMETHEUS_URL": ""}):
         response = client.get("/api/metrics")
         assert response.status_code == 200
         data = response.json()
@@ -959,4 +872,324 @@ def test_experiments_comparison_metrics_fields():
                 assert "error_rate_pct" in metrics
                 assert "mae" in metrics
                 assert "rmse" in metrics
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Live Data-Driven Prophet Forecasting Pipeline Validation
+# ---------------------------------------------------------------------------
+
+def test_live_data_prophet_fits_using_real_prometheus_observations():
+    """1. Verify Prophet model fits using real Prometheus observations."""
+    mock_points = [(1700000000.0 + i * 5, 10.0 + i * 0.5) for i in range(10)]
+    with patch("backend.main.get_prometheus_url", return_value="http://prometheus:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=mock_points):
+            fcst_df, provenance, detail = get_or_generate_forecast(force_refresh=True)
+            assert provenance == "live_prometheus"
+            assert len(fcst_df) > 0
+            assert "yhat" in fcst_df.columns
+            assert (fcst_df["yhat"] >= 0.0).all()
+
+            response = client.get("/api/forecast?limit=5")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["provenance"] == "live_prometheus"
+            assert data["valid_historical_observations"] == 10
+            assert data["prediction_source"] == "Live Prophet only"
+            assert data["last_fitting_timestamp"] is not None
+
+
+def test_live_data_insufficient_observations_produce_waiting_state():
+    """2. Verify fewer than 5 observations produce waiting state and exact required message."""
+    mock_points = [(1700000000.0, 5.0), (1700000005.0, 6.0)]
+    with patch("backend.main.get_prometheus_url", return_value="http://prometheus:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=mock_points):
+            response = client.get("/api/forecast?force_refresh=true")
+            assert response.status_code == 422
+            assert "Waiting for sufficient live Prometheus observations to fit Prophet." in response.json()["detail"]
+
+            status_resp = client.get("/api/autoscaling/status")
+            assert status_resp.status_code == 200
+            status_data = status_resp.json()
+            assert status_data["forecast_status"] == "waiting_for_data"
+            assert status_data["model_status"] == "Waiting for data"
+
+
+def test_live_data_new_observations_trigger_periodic_refitting():
+    """3. Verify new observations trigger refitting and update cache."""
+    points1 = [(1700000000.0 + i * 5, 8.0) for i in range(8)]
+    points2 = [(1700000100.0 + i * 5, 25.0) for i in range(8)]
+
+    with patch("backend.main.get_prometheus_url", return_value="http://prometheus:9090"):
+        forecast_cache.clear()
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=points1):
+            val1, prov1, _, _, _ = refresh_prediction(force_refresh=True)
+            assert prov1 == "live_prometheus"
+
+        # Clear cache to bypass < 1.0s debouncing
+        forecast_cache.clear()
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=points2):
+            val2, prov2, _, _, _ = refresh_prediction(force_refresh=True)
+            assert prov2 == "live_prometheus"
+            # New points at 25.0 should produce higher prediction than baseline 8.0
+            assert val2 > val1
+
+
+def test_live_data_predictions_published_to_prometheus():
+    """4. Verify predicted request rate is published to Prometheus gauge."""
+    mock_points = [(1700000000.0 + i * 5, 15.0) for i in range(10)]
+    with patch("backend.main.get_prometheus_url", return_value="http://prometheus:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=mock_points):
+            val, prov, _, _, _ = refresh_prediction(force_refresh=True)
+            assert PREDICTED_LOAD_GAUGE._value.get() == val
+            assert PREDICTION_PROVENANCE_GAUGE._value.get() == 1.0
+
+            metrics_resp = client.get("/metrics")
+            assert metrics_resp.status_code == 200
+            metrics_text = metrics_resp.text
+            assert "predicted_http_work_rps" in metrics_text
+            assert f"predicted_http_work_rps {val}" in metrics_text
+            assert "prediction_provenance 1.0" in metrics_text
+
+
+def test_live_data_prediction_timestamps_update_correctly():
+    """5. Verify prediction timestamps advance on success and halt on failure."""
+    before_ts = time.time()
+    mock_points = [(1700000000.0 + i * 5, 12.0) for i in range(10)]
+    with patch("backend.main.get_prometheus_url", return_value="http://prometheus:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=mock_points):
+            refresh_prediction(force_refresh=True)
+            updated_ts = PREDICTION_TIMESTAMP_GAUGE._value.get()
+            assert updated_ts >= before_ts
+
+    # Clear cache and verify that when fitting fails (e.g. 0 points), timestamp should NOT advance
+    forecast_cache.clear()
+    with patch("backend.main.get_prometheus_url", return_value="http://prometheus:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=[]):
+            with pytest.raises(Exception):
+                refresh_prediction(force_refresh=True)
+            # Timestamp remains unchanged
+            assert PREDICTION_TIMESTAMP_GAUGE._value.get() == updated_ts
+            # Predicted load is reset to 0.0 to prevent ungrounded scaling
+            assert PREDICTED_LOAD_GAUGE._value.get() == 0.0
+
+
+def test_live_data_insufficient_metrics_raises_waiting_detail():
+    """6. Verify insufficient observations (<5) raises 422 with clear waiting detail."""
+    with patch("backend.main.get_prometheus_url", return_value="http://prometheus:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=[]):
+            forecast_cache.clear()
+            response = client.get("/api/forecast?force_refresh=true")
+            assert response.status_code == 422
+            assert "waiting for sufficient" in response.json()["detail"].lower()
+
+
+def test_live_data_missing_or_stale_predictions_handled_safely():
+    """7. Verify stale predictions (>45s) are gated out from /api/metrics and status."""
+    dummy_df = pd.DataFrame({"ds": ["2026-01-01 00:00:00"], "yhat": [22.0], "yhat_lower": [18.0], "yhat_upper": [26.0]})
+    forecast_cache.update(dummy_df, "live_prometheus", "test cache")
+    # Set stale timestamp (60 seconds ago)
+    PREDICTION_TIMESTAMP_GAUGE.set(time.time() - 60.0)
+
+    status_resp = client.get("/api/autoscaling/status")
+    assert status_resp.status_code == 200
+    data = status_resp.json()
+    assert data["is_fresh"] is False
+    assert data["prediction_age_seconds"] >= 45.0
+    assert data["forecast_status"] == "stale"
+
+
+def test_live_data_keda_consumes_genuine_prediction_metric():
+    """8. Verify KEDA consumes genuine live prediction metric and query threshold."""
+    response = client.get("/api/autoscaling/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["metric_name"] == "predicted_http_work_rps"
+    assert data["metric_threshold"] == 10.0
+    assert "max(predicted_http_work_rps)" in data["query"]
+    assert "time() - max(prediction_timestamp_seconds)" in data["query"]
+
+
+def test_live_data_dashboard_displays_actual_backend_and_forecasting_states():
+    """9. Verify dashboard models return required metadata: last fit, count, model status, source."""
+    health_resp = client.get("/health")
+    assert health_resp.status_code == 200
+    h_data = health_resp.json()
+    assert "last_fitting_timestamp" in h_data
+    assert "valid_historical_observations" in h_data
+    assert "model_status" in h_data
+    assert h_data["prediction_source"] == "Live Prophet only"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Research Experiment CSV Export and Download
+# ---------------------------------------------------------------------------
+
+def test_download_individual_experiment_csv_success(tmp_path, monkeypatch):
+    """Verify downloading an individual completed experiment returns the genuine CSV file."""
+    from backend.main import get_experiments_dir
+    res_dir = get_experiments_dir("results")
+    res_dir.mkdir(parents=True, exist_ok=True)
+    test_csv = res_dir / "hpa_stable.csv"
+    sample_content = (
+        "timestamp_utc,epoch_timestamp,cpu_usage_cores,http_work_rps,latency_p95_seconds\n"
+        "2026-11-24T12:00:00+00:00,1793270000.0,0.25,18.5,0.035\n"
+        "2026-11-24T12:00:05+00:00,1793270005.0,0.30,22.0,0.040\n"
+    )
+    test_csv.write_bytes(sample_content.encode("utf-8"))
+
+    try:
+        resp = client.get("/api/experiments/download/hpa/stable?source=results")
+        assert resp.status_code == 200
+        assert "text/csv" in resp.headers.get("content-type", "")
+        assert "attachment; filename=\"hpa_stable.csv\"" in resp.headers.get("content-disposition", "")
+        assert resp.content.decode("utf-8").replace("\r\n", "\n") == sample_content
+    finally:
+        if test_csv.exists():
+            test_csv.unlink()
+
+
+def test_download_experiment_csv_missing_raises_clear_404():
+    """Verify downloading a non-existent experiment returns 404 with a clear message."""
+    resp = client.get("/api/experiments/download/hpa/nonexistent_profile?source=results")
+    assert resp.status_code == 400
+
+    resp404 = client.get("/api/experiments/download/predictive/bursty?source=results")
+    assert resp404.status_code == 404
+    assert "no completed experiment results available" in resp404.json()["detail"].lower()
+
+
+def test_download_all_experiments_zip_success(tmp_path):
+    """Verify downloading all completed experiments returns a valid zip containing all CSVs."""
+    import zipfile
+    import io
+    from backend.main import get_experiments_dir
+    res_dir = get_experiments_dir("results")
+    res_dir.mkdir(parents=True, exist_ok=True)
+    hpa_file = res_dir / "hpa_bursty.csv"
+    pred_file = res_dir / "predictive_bursty.csv"
+
+    hpa_content = "timestamp_utc,http_work_rps\n2026-11-24T12:00:00,10.0\n"
+    pred_content = "timestamp_utc,http_work_rps\n2026-11-24T12:00:00,12.0\n"
+    hpa_file.write_bytes(hpa_content.encode("utf-8"))
+    pred_file.write_bytes(pred_content.encode("utf-8"))
+
+    try:
+        resp = client.get("/api/experiments/download-all?source=results")
+        assert resp.status_code == 200
+        assert "application/zip" in resp.headers.get("content-type", "")
+        assert "attachment; filename=" in resp.headers.get("content-disposition", "")
+
+        zf = zipfile.ZipFile(io.BytesIO(resp.content))
+        names = zf.namelist()
+        assert "hpa_bursty.csv" in names
+        assert "predictive_bursty.csv" in names
+        assert zf.read("hpa_bursty.csv").decode("utf-8").replace("\r\n", "\n") == hpa_content
+        assert zf.read("predictive_bursty.csv").decode("utf-8").replace("\r\n", "\n") == pred_content
+    finally:
+        if hpa_file.exists():
+            hpa_file.unlink()
+        if pred_file.exists():
+            pred_file.unlink()
+
+
+def test_download_all_experiments_empty_raises_404():
+    """Verify downloading all experiments when none exist returns 404."""
+    from backend.main import get_experiments_dir
+    res_dir = get_experiments_dir("results")
+    # Ensure results dir has no CSVs
+    for f in res_dir.glob("*.csv"):
+        f.unlink()
+
+    resp = client.get("/api/experiments/download-all?source=results")
+    assert resp.status_code == 404
+    assert "no completed experiment results available" in resp.json()["detail"].lower()
+
+
+def test_to_utc_iso_helper():
+    """Verify to_utc_iso converts numeric epochs, naive datetimes, and aware datetimes to UTC ISO-8601."""
+    from backend.main import to_utc_iso
+    import datetime
+
+    # Epoch in seconds
+    epoch_ts = 1764000000.0
+    iso_val = to_utc_iso(epoch_ts)
+    assert "+00:00" in iso_val or iso_val.endswith("Z")
+
+    # Timezone-naive pandas Timestamp
+    naive_ts = pd.Timestamp("2026-11-24 12:00:00")
+    iso_naive = to_utc_iso(naive_ts)
+    assert iso_naive.startswith("2026-11-24T12:00:00")
+    assert "+00:00" in iso_naive or iso_naive.endswith("Z")
+
+    # Timezone-aware timestamp
+    aware_ts = pd.Timestamp("2026-11-24 17:30:00+05:30")
+    iso_aware = to_utc_iso(aware_ts)
+    assert iso_aware.startswith("2026-11-24T12:00:00")
+    assert "+00:00" in iso_aware or iso_aware.endswith("Z")
+
+
+def test_utc_to_ist_conversion():
+    """Verify UTC timestamps convert to Asia/Kolkata (IST, UTC+5:30) with exact 5:30 offset."""
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+
+    utc_dt = datetime.fromisoformat("2026-11-24T12:00:00+00:00")
+    ist_tz = ZoneInfo("Asia/Kolkata")
+    ist_dt = utc_dt.astimezone(ist_tz)
+
+    assert ist_dt.hour == 17
+    assert ist_dt.minute == 30
+    assert ist_dt.second == 0
+    assert str(ist_dt.utcoffset()) == "5:30:00"
+
+
+def test_forecast_endpoint_returns_explicit_utc_iso():
+    """Verify /api/forecast returns ds in explicit UTC ISO format for history and forecast points."""
+    now_epoch = 1764000000.0
+    fake_points = [
+        (now_epoch - 60, 2.0),
+        (now_epoch - 45, 3.0),
+        (now_epoch - 30, 4.0),
+        (now_epoch - 15, 5.0),
+        (now_epoch, 6.0),
+    ]
+
+    with patch("backend.main.fetch_prometheus_range_metrics", return_value=fake_points):
+        resp = client.get("/api/forecast?force_refresh=true")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["provenance"] == "live_prometheus"
+        assert len(data["data"]) > 0
+        for item in data["data"]:
+            assert "T" in item["ds"]
+            assert "+00:00" in item["ds"] or item["ds"].endswith("Z")
+
+        assert len(data["history"]) == 5
+        for h in data["history"]:
+            assert "T" in h["ds"]
+            assert "+00:00" in h["ds"] or h["ds"].endswith("Z")
+
+
+def test_predicted_load_endpoint_target_timestamp_utc_iso():
+    """Verify /api/predicted-load returns target_timestamp in explicit UTC ISO format."""
+    now_epoch = 1764000000.0
+    fake_points = [
+        (now_epoch - 60, 2.0),
+        (now_epoch - 45, 3.0),
+        (now_epoch - 30, 4.0),
+        (now_epoch - 15, 5.0),
+        (now_epoch, 6.0),
+    ]
+
+    with patch("backend.main.fetch_prometheus_range_metrics", return_value=fake_points):
+        resp = client.get("/api/predicted-load?aggregation=point&horizon_steps=5")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "target_timestamp" in data
+        assert "T" in data["target_timestamp"]
+        assert "+00:00" in data["target_timestamp"] or data["target_timestamp"].endswith("Z")
+
+
+
 

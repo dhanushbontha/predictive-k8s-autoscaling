@@ -1,6 +1,7 @@
 import React from 'react';
 import { RefreshCw, Activity, Database, Shield } from 'lucide-react';
 import StatusBadge from './StatusBadge';
+import { formatToIstTime } from '../utils/timezone';
 
 export default function Navbar({
   activeTab,
@@ -85,7 +86,7 @@ export default function Navbar({
         <div className="flex items-center gap-3 pl-2 border-l border-slate-800">
           {lastUpdated && (
             <span className="text-xs text-slate-400 font-mono hidden lg:inline">
-              {lastUpdated.toLocaleTimeString()}
+              {formatToIstTime(lastUpdated)} IST
             </span>
           )}
           <button

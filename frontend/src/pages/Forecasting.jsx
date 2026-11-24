@@ -11,6 +11,12 @@ import {
 import MetricCard from '../components/MetricCard';
 import StatusBadge from '../components/StatusBadge';
 import {
+  formatToIstTime,
+  formatToIstDateTime,
+  formatToIstChartTime,
+  formatToIstTooltipTime,
+} from '../utils/timezone';
+import {
   ResponsiveContainer,
   ComposedChart,
   Line,
@@ -46,7 +52,10 @@ export default function Forecasting({
   let predictedVariant = 'cyan';
 
   const isInsufficient = Boolean(
-    activeError && (activeError.toLowerCase().includes('insufficient') || activeError.toLowerCase().includes('at least 5'))
+    activeError &&
+      (activeError.toLowerCase().includes('insufficient') ||
+        activeError.toLowerCase().includes('waiting for sufficient') ||
+        activeError.toLowerCase().includes('at least 5'))
   );
   const isWaiting =
     forecastStatus === 'waiting_for_data' ||
@@ -63,10 +72,10 @@ export default function Forecasting({
     predictedSubtitle = (
       <span
         className="flex items-center gap-1.5 text-amber-400 text-xs font-medium"
-        title={activeError || 'Awaiting 5 traffic samples on /api/work'}
+        title="Waiting for sufficient live Prometheus observations to fit Prophet."
       >
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 animate-pulse" />
-        <span>Waiting for live data</span>
+        <span>Waiting for data</span>
       </span>
     );
     predictedVariant = 'amber';
@@ -91,9 +100,23 @@ export default function Forecasting({
     predictedDisplay = '--';
     predictedUnit = 'req/s';
     predictedBadge = null;
-    predictedSubtitle = activeError || 'Waiting for live data';
+    predictedSubtitle = 'Waiting for sufficient live Prometheus observations to fit Prophet.';
     predictedVariant = 'amber';
   }
+
+  const modelStatus = autoscalingStatus?.model_status || forecastData?.model_status || (isFresh ? 'Forecasting' : 'Waiting for data');
+  const validObservations =
+    autoscalingStatus?.valid_historical_observations ??
+    forecastData?.valid_historical_observations ??
+    (historyPoints ? historyPoints.length : 0);
+  const lastFittingTimeStr = autoscalingStatus?.last_fitting_timestamp
+    ? formatToIstTime(autoscalingStatus.last_fitting_timestamp)
+    : forecastData?.last_fitting_timestamp
+    ? formatToIstTime(forecastData.last_fitting_timestamp)
+    : '--';
+  const lastPredictionTimeStr = autoscalingStatus?.last_prediction_timestamp && autoscalingStatus.last_prediction_timestamp > 0
+    ? formatToIstTime(autoscalingStatus.last_prediction_timestamp)
+    : '--';
 
   const historyPoints = (isFresh || forecastData) ? (forecastData?.history || []) : [];
   const forecastPoints = (isFresh && forecastData) ? (forecastData?.data || forecastData?.forecast || []) : [];
@@ -112,11 +135,8 @@ export default function Forecasting({
     let timeLabel = `H-${historyPoints.length - idx}`;
     let fullTime = `History Point ${idx + 1}`;
     if (h.ds) {
-      const d = new Date(h.ds);
-      if (!isNaN(d.getTime())) {
-        timeLabel = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        fullTime = d.toLocaleTimeString();
-      }
+      timeLabel = formatToIstChartTime(h.ds);
+      fullTime = `${formatToIstTooltipTime(h.ds)} (Observed)`;
     }
     chartData.push({
       time: timeLabel,
@@ -134,11 +154,8 @@ export default function Forecasting({
     let fullTime = `Forecast Step ${idx + 1}`;
     const tsStr = pt.ds || pt.timestamp;
     if (tsStr) {
-      const d = new Date(tsStr);
-      if (!isNaN(d.getTime())) {
-        timeLabel = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        fullTime = d.toLocaleTimeString();
-      }
+      timeLabel = formatToIstChartTime(tsStr);
+      fullTime = `${formatToIstTooltipTime(tsStr)} (Predicted)`;
     }
     chartData.push({
       time: timeLabel,
@@ -152,7 +169,7 @@ export default function Forecasting({
 
   const generatedEpoch = forecastData?.generated_at_epoch;
   const generatedTimeStr = generatedEpoch
-    ? new Date(generatedEpoch * 1000).toLocaleTimeString()
+    ? formatToIstTime(generatedEpoch)
     : 'N/A';
 
   return (
@@ -217,7 +234,7 @@ export default function Forecasting({
             <Info className="w-4 h-4 text-amber-400 shrink-0" />
             <span className="text-amber-200">
               {activeError ||
-                'Awaiting 5 traffic observations on /api/work. Launch a profile in the Workload tab to begin forecasting.'}
+                'Waiting for sufficient live Prometheus observations to fit Prophet.'}
             </span>
           </div>
           <span className="text-[11px] text-slate-400 font-mono shrink-0">
@@ -227,7 +244,7 @@ export default function Forecasting({
       )}
 
       {/* KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-4">
         <MetricCard
           title="Current Predicted RPS"
           value={predictedDisplay}
@@ -236,6 +253,29 @@ export default function Forecasting({
           subtitle={predictedSubtitle}
           icon={TrendingUp}
           variant={predictedVariant}
+        />
+        <MetricCard
+          title="Model Status"
+          value={modelStatus}
+          subtitle="Live Prophet only"
+          icon={Activity}
+          variant={modelStatus === 'Forecasting' ? 'cyan' : modelStatus === 'Training/Fitting' ? 'purple' : 'amber'}
+          valueClassName="text-xl sm:text-2xl font-bold font-sans tracking-tight leading-snug break-words text-slate-100"
+        />
+        <MetricCard
+          title="Live Observations"
+          value={validObservations > 0 ? validObservations : '--'}
+          unit={validObservations > 0 ? 'samples' : ''}
+          subtitle="Min 5 required to fit"
+          icon={Database}
+          variant="emerald"
+        />
+        <MetricCard
+          title="Last Model Fit"
+          value={lastFittingTimeStr}
+          subtitle={`Prediction: ${lastPredictionTimeStr}`}
+          icon={Clock}
+          variant="purple"
         />
         <MetricCard
           title="Prediction Freshness"
@@ -249,20 +289,12 @@ export default function Forecasting({
           variant={isFresh ? 'emerald' : 'amber'}
         />
         <MetricCard
-          title="Horizon Peak (yhat_upper)"
+          title="Horizon Peak"
           value={maxYhat}
           unit="req/s"
-          subtitle={`Max predicted in next ${horizonLimit} steps`}
+          subtitle={`Floor: ${minYhat} req/s`}
           icon={Layers}
-          variant="purple"
-        />
-        <MetricCard
-          title="Horizon Floor (yhat_lower)"
-          value={minYhat}
-          unit="req/s"
-          subtitle={`Min predicted in next ${horizonLimit} steps`}
-          icon={Database}
-          variant="emerald"
+          variant="cyan"
         />
       </div>
 
@@ -417,11 +449,11 @@ export default function Forecasting({
               <h4 className="text-sm font-semibold text-slate-200 mb-1">
                 {forecastStatus === 'stale'
                   ? 'Forecast Stale (Validity Gate Closed)'
-                  : 'Forecast Projections Awaiting Traffic'}
+                  : 'Waiting for sufficient live Prometheus observations to fit Prophet.'}
               </h4>
               <p className="max-w-md text-slate-400 leading-relaxed mb-4">
                 {activeError ||
-                  'The forecasting backend requires at least 5 consecutive live Prometheus traffic observations on target-app (/api/work) before fitting a Prophet time-series model.'}
+                  'Waiting for sufficient live Prometheus observations to fit Prophet. At least 5 live observations on /api/work are required before fitting a Prophet time-series model.'}
               </p>
               <div className="flex items-center gap-2 text-[11px] text-slate-400">
                 <span>Tip: Go to the <strong className="text-cyan-400">Workload Generator</strong> tab and launch any profile to generate live traffic.</span>
@@ -476,7 +508,7 @@ export default function Forecasting({
                     return (
                       <tr key={idx} className="hover:bg-slate-800/30 transition-colors">
                         <td className="py-2 px-3 text-slate-400">{idx + 1}</td>
-                        <td className="py-2 px-3 text-slate-300">{pt.ds || pt.timestamp || `+${idx * 15}s`}</td>
+                        <td className="py-2 px-3 text-slate-300">{(pt.ds || pt.timestamp) ? formatToIstDateTime(pt.ds || pt.timestamp) : `+${idx * 15}s`}</td>
                         <td className="py-2 px-3 text-cyan-400 font-semibold">{yhat} req/s</td>
                         <td className="py-2 px-3 text-slate-400">{lower}</td>
                         <td className="py-2 px-3 text-slate-400">{upper}</td>

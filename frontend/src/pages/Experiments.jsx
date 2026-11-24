@@ -13,8 +13,12 @@ import {
   Zap,
   Target,
   RefreshCw,
+  Download,
+  FolderArchive,
+  FileDown,
 } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
+import api from '../services/api';
 import {
   ResponsiveContainer,
   BarChart,
@@ -33,6 +37,73 @@ export default function Experiments({
   onFetchExperiments,
 }) {
   const [activeProfileTab, setActiveProfileTab] = useState('stable');
+  const [downloadStatus, setDownloadStatus] = useState({ type: 'idle', message: '' });
+
+  const handleDownloadCsv = async (autoscaler, profile) => {
+    try {
+      setDownloadStatus({ type: 'loading', message: `Downloading ${autoscaler.toUpperCase()} (${profile}) CSV...` });
+      const res = await api.downloadExperimentCsv(autoscaler, profile, experimentSource);
+      const blob = new Blob([res.data], { type: 'text/csv' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${autoscaler.toLowerCase()}_${profile.toLowerCase()}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      setDownloadStatus({ type: 'success', message: `Downloaded ${autoscaler.toUpperCase()} (${profile}) CSV successfully.` });
+      setTimeout(() => setDownloadStatus({ type: 'idle', message: '' }), 4000);
+    } catch (err) {
+      let errMsg = `No experiment results available for ${autoscaler.toUpperCase()} (${profile}). Run an experiment first.`;
+      if (err.response?.data) {
+        try {
+          if (err.response.data instanceof Blob) {
+            const txt = await err.response.data.text();
+            const parsed = JSON.parse(txt);
+            if (parsed.detail) errMsg = parsed.detail;
+          } else if (err.response.data.detail) {
+            errMsg = err.response.data.detail;
+          }
+        } catch (_) {}
+      }
+      setDownloadStatus({ type: 'error', message: errMsg });
+      setTimeout(() => setDownloadStatus({ type: 'idle', message: '' }), 6000);
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    try {
+      setDownloadStatus({ type: 'loading', message: 'Generating and downloading archive of all completed experiments...' });
+      const res = await api.downloadAllExperimentsZip(experimentSource);
+      const blob = new Blob([res.data], { type: 'application/zip' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `all_completed_experiments_${experimentSource}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      setDownloadStatus({ type: 'success', message: 'Downloaded all completed experiment results (.zip).' });
+      setTimeout(() => setDownloadStatus({ type: 'idle', message: '' }), 4000);
+    } catch (err) {
+      let errMsg = 'No completed experiment results available to download in experiments/results/. Run an experiment first.';
+      if (err.response?.data) {
+        try {
+          if (err.response.data instanceof Blob) {
+            const txt = await err.response.data.text();
+            const parsed = JSON.parse(txt);
+            if (parsed.detail) errMsg = parsed.detail;
+          } else if (err.response.data.detail) {
+            errMsg = err.response.data.detail;
+          }
+        } catch (_) {}
+      }
+      setDownloadStatus({ type: 'error', message: errMsg });
+      setTimeout(() => setDownloadStatus({ type: 'idle', message: '' }), 6000);
+    }
+  };
 
   // Workload profiles in canonical order
   const canonicalProfiles = ['stable', 'gradual', 'bursty', 'periodic', 'noisy'];
@@ -155,31 +226,12 @@ export default function Experiments({
           </div>
         </div>
 
-        {/* View Mode Toggle: Clean Research Results vs Historical Backups */}
+        {/* Clean Research Datasets Source Badge */}
         <div className="flex items-center gap-2">
-          <div className="bg-slate-950 p-1 rounded-lg border border-slate-800 flex items-center text-xs">
-            <button
-              onClick={() => handleSourceChange('results')}
-              className={`px-3 py-1.5 rounded-md font-medium transition-colors flex items-center gap-1.5 ${
-                experimentSource === 'results'
-                  ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Zap className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Clean Results (experiments/results/)</span>
-            </button>
-            <button
-              onClick={() => handleSourceChange('historical')}
-              className={`px-3 py-1.5 rounded-md font-medium transition-colors flex items-center gap-1.5 ${
-                experimentSource === 'historical'
-                  ? 'bg-purple-500/10 text-purple-400 border border-purple-500/30'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Historical Backups</span>
-            </button>
+          <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono flex items-center gap-2">
+            <Zap className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="text-slate-400">Dataset Source: </span>
+            <span className="text-cyan-400 font-semibold">Clean Research Datasets (experiments/results/)</span>
           </div>
         </div>
       </div>
@@ -189,28 +241,61 @@ export default function Experiments({
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-slate-400">Dataset Source:</span>
           <span className="font-mono text-cyan-400 font-semibold">
-            {experimentSource === 'results'
-              ? 'Clean Research Datasets (experiments/results/)'
-              : 'Historical Backup Datasets (experiments/hpa_*.csv)'}
+            Clean Research Datasets (experiments/results/)
           </span>
           <span className="text-slate-600">&bull;</span>
           <span className="text-slate-400">
-            {experimentSource === 'results'
-              ? 'Loads only newly executed experiment runs. Zero fabricated metrics.'
-              : 'Archived reference baseline data.'}
+            Loads only newly executed experiment runs. Zero fabricated metrics.
           </span>
         </div>
 
-        {onNavigate && (
+        <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
           <button
-            onClick={() => onNavigate('workload')}
-            className="text-xs px-2.5 py-1 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 font-medium flex items-center gap-1.5 transition-colors self-start sm:self-auto"
+            onClick={handleDownloadAll}
+            className="text-xs px-2.5 py-1 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-medium flex items-center gap-1.5 transition-colors"
+            title="Download all genuine completed experiment CSVs as a ZIP archive"
           >
-            <Zap className="w-3.5 h-3.5" />
-            Workload Runner
+            <FolderArchive className="w-3.5 h-3.5" />
+            Download All Results (.ZIP)
           </button>
-        )}
+
+          {onNavigate && (
+            <button
+              onClick={() => onNavigate('workload')}
+              className="text-xs px-2.5 py-1 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 font-medium flex items-center gap-1.5 transition-colors"
+            >
+              <Zap className="w-3.5 h-3.5" />
+              Workload Runner
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* CSV Export & Download Feedback Notification */}
+      {downloadStatus.type !== 'idle' && (
+        <div
+          className={`p-3 rounded-xl border text-xs flex items-center justify-between gap-2.5 transition-all ${
+            downloadStatus.type === 'error'
+              ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+              : downloadStatus.type === 'loading'
+                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-300'
+                : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {downloadStatus.type === 'error' && <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0" />}
+            {downloadStatus.type === 'loading' && <RefreshCw className="w-4 h-4 text-cyan-400 animate-spin flex-shrink-0" />}
+            {downloadStatus.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />}
+            <span>{downloadStatus.message}</span>
+          </div>
+          <button
+            onClick={() => setDownloadStatus({ type: 'idle', message: '' })}
+            className="text-slate-400 hover:text-slate-200 text-xs px-1.5"
+          >
+            &times;
+          </button>
+        </div>
+      )}
 
       {/* Profile Selector Tabs (Supports all 5 patterns) */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1 border-b border-slate-800">
@@ -224,11 +309,10 @@ export default function Experiments({
             <button
               key={p.profile}
               onClick={() => setActiveProfileTab(p.profile)}
-              className={`px-4 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap flex items-center gap-2 ${
-                isSelected
-                  ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 font-semibold'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-              }`}
+              className={`px-4 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap flex items-center gap-2 ${isSelected
+                ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 font-semibold'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                }`}
             >
               <span className="uppercase font-mono">{p.profile}</span>
               {hasBoth ? (
@@ -248,7 +332,7 @@ export default function Experiments({
       {/* 3 Prominent Autoscaler Benchmark Status Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {/* Card 1: Traditional CPU HPA */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 backdrop-blur-sm space-y-2">
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 backdrop-blur-sm space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-cyan-400 flex items-center gap-1.5">
               <Cpu className="w-4 h-4" />
@@ -260,28 +344,48 @@ export default function Experiments({
             />
           </div>
           {hpa ? (
-            <div>
-              <div className="text-lg font-bold text-slate-100 font-mono">
-                {getP95(hpa) !== undefined ? `${getP95(hpa).toFixed(1)} ms` : '--'}
+            <div className="space-y-3">
+              <div>
+                <div className="text-lg font-bold text-slate-100 font-mono">
+                  {getP95(hpa) !== undefined ? `${getP95(hpa).toFixed(1)} ms` : '--'}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  P95 Latency &bull; {hpa.total_samples} samples ({hpa.duration_seconds}s)
+                </p>
               </div>
-              <p className="text-[11px] text-slate-400 mt-1">
-                P95 Latency &bull; {hpa.total_samples} samples ({hpa.duration_seconds}s)
-              </p>
+              <button
+                onClick={() => handleDownloadCsv('hpa', currentProfile?.profile)}
+                className="w-full text-xs py-1.5 px-3 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 font-medium flex items-center justify-center gap-1.5 transition-colors"
+                title={`Download experiments/results/hpa_${currentProfile?.profile}.csv`}
+              >
+                <Download className="w-3.5 h-3.5" />
+                Download HPA CSV ({currentProfile?.profile})
+              </button>
             </div>
           ) : (
-            <div>
-              <div className="text-sm font-medium text-slate-400">
-                Awaiting experiment data
+            <div className="space-y-3">
+              <div>
+                <div className="text-sm font-medium text-slate-400">
+                  Awaiting experiment data
+                </div>
+                <p className="text-[11px] text-slate-500 font-mono mt-1">
+                  Target: experiments/results/hpa_{currentProfile?.profile}.csv
+                </p>
               </div>
-              <p className="text-[11px] text-slate-500 font-mono mt-1">
-                Target: experiments/results/hpa_{currentProfile?.profile}.csv
-              </p>
+              <button
+                disabled
+                className="w-full text-xs py-1.5 px-3 rounded-lg bg-slate-950 border border-slate-800 text-slate-500 font-medium flex items-center justify-center gap-1.5 cursor-not-allowed opacity-60"
+                title="No completed experiment data available yet for CPU HPA"
+              >
+                <Download className="w-3.5 h-3.5" />
+                No CSV Available
+              </button>
             </div>
           )}
         </div>
 
         {/* Card 2: Predictive KEDA */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 backdrop-blur-sm space-y-2">
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 backdrop-blur-sm space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-purple-400 flex items-center gap-1.5">
               <Zap className="w-4 h-4" />
@@ -293,22 +397,42 @@ export default function Experiments({
             />
           </div>
           {predictive ? (
-            <div>
-              <div className="text-lg font-bold text-slate-100 font-mono">
-                {getP95(predictive) !== undefined ? `${getP95(predictive).toFixed(1)} ms` : '--'}
+            <div className="space-y-3">
+              <div>
+                <div className="text-lg font-bold text-slate-100 font-mono">
+                  {getP95(predictive) !== undefined ? `${getP95(predictive).toFixed(1)} ms` : '--'}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  P95 Latency &bull; {predictive.total_samples} samples ({predictive.duration_seconds}s)
+                </p>
               </div>
-              <p className="text-[11px] text-slate-400 mt-1">
-                P95 Latency &bull; {predictive.total_samples} samples ({predictive.duration_seconds}s)
-              </p>
+              <button
+                onClick={() => handleDownloadCsv('predictive', currentProfile?.profile)}
+                className="w-full text-xs py-1.5 px-3 rounded-lg bg-purple-500/10 hover:bg-purple-500/20 text-purple-400 border border-purple-500/30 font-medium flex items-center justify-center gap-1.5 transition-colors"
+                title={`Download experiments/results/predictive_${currentProfile?.profile}.csv`}
+              >
+                <Download className="w-3.5 h-3.5" />
+                Download KEDA CSV ({currentProfile?.profile})
+              </button>
             </div>
           ) : (
-            <div>
-              <div className="text-sm font-medium text-slate-400">
-                Awaiting experiment data
+            <div className="space-y-3">
+              <div>
+                <div className="text-sm font-medium text-slate-400">
+                  Awaiting experiment data
+                </div>
+                <p className="text-[11px] text-slate-500 font-mono mt-1">
+                  Target: experiments/results/predictive_{currentProfile?.profile}.csv
+                </p>
               </div>
-              <p className="text-[11px] text-slate-500 font-mono mt-1">
-                Target: experiments/results/predictive_{currentProfile?.profile}.csv
-              </p>
+              <button
+                disabled
+                className="w-full text-xs py-1.5 px-3 rounded-lg bg-slate-950 border border-slate-800 text-slate-500 font-medium flex items-center justify-center gap-1.5 cursor-not-allowed opacity-60"
+                title="No completed experiment data available yet for Predictive KEDA"
+              >
+                <Download className="w-3.5 h-3.5" />
+                No CSV Available
+              </button>
             </div>
           )}
         </div>
@@ -343,8 +467,8 @@ export default function Experiments({
                 {!hpa && !predictive
                   ? 'Awaiting both CPU HPA and KEDA datasets'
                   : !hpa
-                  ? 'Awaiting CPU HPA dataset to compare'
-                  : 'Awaiting Predictive KEDA dataset to compare'}
+                    ? 'Awaiting CPU HPA dataset to compare'
+                    : 'Awaiting Predictive KEDA dataset to compare'}
               </p>
             </div>
           )}
