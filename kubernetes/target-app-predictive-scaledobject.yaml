@@ -13,9 +13,8 @@ spec:
     kind: Deployment
     name: target-app
   minReplicaCount: 1
-  maxReplicaCount: 5
+  maxReplicaCount: 10
   pollingInterval: 5
-  cooldownPeriod: 30
   fallback:
     failureThreshold: 3
     replicas: 2
