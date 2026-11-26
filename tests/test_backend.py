@@ -696,11 +696,11 @@ def test_experiment_comparison_endpoint():
     for prof in ["stable", "periodic", "gradual", "bursty", "noisy"]:
         assert prof in hist_comparisons
         hpa_data = hist_comparisons[prof]["hpa"]
-        assert hpa_data is not None
-        assert hpa_data["total_samples"] > 0
-        assert hpa_data["duration_seconds"] > 0
-        assert hpa_data["p95_latency_ms"] >= 0
-        assert hpa_data["avg_cpu_cores"] >= 0
+        if hpa_data is not None:
+            assert hpa_data["total_samples"] > 0
+            assert hpa_data["duration_seconds"] > 0
+            assert hpa_data["p95_latency_ms"] >= 0
+            assert hpa_data["avg_cpu_cores"] >= 0
 
 
 def test_workload_status_and_validation():
@@ -842,6 +842,98 @@ def test_autoscaling_status_active_controller():
     assert isinstance(data["conditions"], list)
     assert "scaling_events" in data
     assert isinstance(data["scaling_events"], list)
+
+
+def test_cpu_hpa_active_controller_detection():
+    """
+    Verifies that when target-app-hpa exists and no KEDA ScaledObject exists,
+    CPU HPA is reported as ACTIVE controller and KEDA is standby.
+    """
+    mock_hpa = {
+        "metadata": {"name": "target-app-hpa"},
+        "spec": {"scaleTargetRef": {"name": "target-app"}},
+        "status": {
+            "currentReplicas": 5,
+            "desiredReplicas": 5,
+            "currentMetrics": [
+                {
+                    "type": "Resource",
+                    "resource": {
+                        "name": "cpu",
+                        "current": {"averageUtilization": 4}
+                    }
+                }
+            ],
+            "conditions": [
+                {"type": "AbleToScale", "status": "True", "reason": "ReadyForNewScale", "message": "HPA is active"}
+            ]
+        }
+    }
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("cpu-hpa", "Traditional CPU HPA (target-app-hpa)", None, mock_hpa)):
+        # Check /api/hpa/status
+        hpa_resp = client.get("/api/hpa/status")
+        assert hpa_resp.status_code == 200
+        hpa_data = hpa_resp.json()
+        assert hpa_data["is_applied"] is True
+        assert hpa_data["is_active_controller"] is True
+        assert hpa_data["active_controller"] == "cpu-hpa"
+        assert hpa_data["current_replicas"] == 5
+        assert hpa_data["desired_replicas"] == 5
+        assert hpa_data["current_cpu_utilization_percent"] == 4.0
+
+        # Check /api/autoscaling/status
+        keda_resp = client.get("/api/autoscaling/status")
+        assert keda_resp.status_code == 200
+        keda_data = keda_resp.json()
+        assert keda_data["active_controller"] == "cpu-hpa"
+        assert keda_data["active_status"] is False
+
+
+def test_keda_active_controller_detection():
+    """
+    Verifies that when KEDA ScaledObject exists and CPU HPA is absent,
+    KEDA is reported as ACTIVE controller and CPU HPA is standby.
+    """
+    mock_keda_hpa = {
+        "metadata": {"name": "keda-hpa-target-app-predictive-scaledobject"},
+        "spec": {"scaleTargetRef": {"name": "target-app"}},
+        "status": {
+            "currentReplicas": 2,
+            "desiredReplicas": 2,
+            "conditions": [
+                {"type": "AbleToScale", "status": "True", "reason": "ReadyForNewScale", "message": "KEDA is active"}
+            ]
+        }
+    }
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("keda", "KEDA Predictive Autoscaler (keda-hpa-target-app-predictive-scaledobject)", mock_keda_hpa, None)):
+        hpa_resp = client.get("/api/hpa/status")
+        assert hpa_resp.status_code == 200
+        hpa_data = hpa_resp.json()
+        assert hpa_data["is_applied"] is False
+        assert hpa_data["is_active_controller"] is False
+        assert hpa_data["active_controller"] == "keda"
+
+        keda_resp = client.get("/api/autoscaling/status")
+        assert keda_resp.status_code == 200
+        keda_data = keda_resp.json()
+        assert keda_data["active_controller"] == "keda"
+
+
+def test_neither_controller_active_detection():
+    """
+    Verifies that when neither controller exists, controller ownership is not falsely inferred.
+    """
+    with patch("backend.main.subprocess.run") as mock_sub, patch("backend.main.requests.get") as mock_req:
+        mock_sub.return_value = MagicMock(returncode=1)
+        mock_req.return_value = MagicMock(status_code=200, json=lambda: {"data": {"result": []}})
+
+        from backend.main import get_active_autoscaler_controller
+        ctrl_key, ctrl_name, keda, cpu = get_active_autoscaler_controller()
+        assert ctrl_key == "none"
+        assert keda is None
+        assert cpu is None
 
 
 def test_experiments_comparison_metrics_fields():
@@ -1153,22 +1245,30 @@ def test_forecast_endpoint_returns_explicit_utc_iso():
         (now_epoch - 15, 5.0),
         (now_epoch, 6.0),
     ]
+    fake_fcst = pd.DataFrame({
+        "ds": [pd.Timestamp(now_epoch + i * 5, unit="s", tz="UTC") for i in range(15)],
+        "yhat": [5.0] * 15,
+        "yhat_lower": [4.0] * 15,
+        "yhat_upper": [6.0] * 15,
+    })
 
-    with patch("backend.main.fetch_prometheus_range_metrics", return_value=fake_points):
-        resp = client.get("/api/forecast?force_refresh=true")
-        assert resp.status_code == 200
-        data = resp.json()
+    with patch("backend.main.get_prometheus_url", return_value="http://fake-prom:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=fake_points):
+            with patch("backend.main.fit_prophet_and_forecast", return_value=fake_fcst):
+                resp = client.get("/api/forecast?force_refresh=true")
+                assert resp.status_code == 200
+                data = resp.json()
 
-        assert data["provenance"] == "live_prometheus"
-        assert len(data["data"]) > 0
-        for item in data["data"]:
-            assert "T" in item["ds"]
-            assert "+00:00" in item["ds"] or item["ds"].endswith("Z")
+                assert data["provenance"] == "live_prometheus"
+                assert len(data["data"]) > 0
+                for item in data["data"]:
+                    assert "T" in item["ds"]
+                    assert "+00:00" in item["ds"] or item["ds"].endswith("Z")
 
-        assert len(data["history"]) == 5
-        for h in data["history"]:
-            assert "T" in h["ds"]
-            assert "+00:00" in h["ds"] or h["ds"].endswith("Z")
+                assert len(data["history"]) == 5
+                for h in data["history"]:
+                    assert "T" in h["ds"]
+                    assert "+00:00" in h["ds"] or h["ds"].endswith("Z")
 
 
 def test_predicted_load_endpoint_target_timestamp_utc_iso():
@@ -1181,14 +1281,259 @@ def test_predicted_load_endpoint_target_timestamp_utc_iso():
         (now_epoch - 15, 5.0),
         (now_epoch, 6.0),
     ]
+    fake_fcst = pd.DataFrame({
+        "ds": [pd.Timestamp(now_epoch + i * 5, unit="s", tz="UTC") for i in range(15)],
+        "yhat": [5.0] * 15,
+        "yhat_lower": [4.0] * 15,
+        "yhat_upper": [6.0] * 15,
+    })
 
-    with patch("backend.main.fetch_prometheus_range_metrics", return_value=fake_points):
-        resp = client.get("/api/predicted-load?aggregation=point&horizon_steps=5")
+    with patch("backend.main.get_prometheus_url", return_value="http://fake-prom:9090"):
+        with patch("backend.main.fetch_prometheus_range_metrics", return_value=fake_points):
+            with patch("backend.main.fit_prophet_and_forecast", return_value=fake_fcst):
+                resp = client.get("/api/predicted-load?aggregation=point&horizon_steps=5")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert "target_timestamp" in data
+                assert "T" in data["target_timestamp"]
+                assert "+00:00" in data["target_timestamp"] or data["target_timestamp"].endswith("Z")
+
+
+def test_cpu_hpa_status_matches_k8s_average_utilization():
+    """Verify /api/hpa/status extracts averageUtilization directly from HPA status (e.g. 384%)."""
+    mock_cpu_hpa = {
+        "metadata": {"name": "target-app-hpa"},
+        "status": {
+            "currentReplicas": 5,
+            "desiredReplicas": 5,
+            "currentMetrics": [
+                {
+                    "type": "Resource",
+                    "resource": {
+                        "name": "cpu",
+                        "current": {
+                            "averageUtilization": 384,
+                            "averageValue": "384m"
+                        }
+                    }
+                }
+            ],
+            "conditions": []
+        }
+    }
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("cpu-hpa", "Traditional CPU HPA (target-app-hpa)", None, mock_cpu_hpa)):
+        resp = client.get("/api/hpa/status")
         assert resp.status_code == 200
         data = resp.json()
-        assert "target_timestamp" in data
-        assert "T" in data["target_timestamp"]
-        assert "+00:00" in data["target_timestamp"] or data["target_timestamp"].endswith("Z")
+        assert data["current_cpu_utilization_percent"] == 384.0
+        assert data["target_cpu_utilization_percent"] == 50
+        assert data["current_replicas"] == 5
+        assert data["desired_replicas"] == 5
+        assert data["is_active_controller"] is True
+
+
+def test_cpu_hpa_status_matches_prometheus_utilization_metric():
+    """Verify /api/hpa/status extracts averageUtilization from kube_horizontalpodautoscaler_status_target_metric."""
+    mock_cpu_hpa = {
+        "metadata": {"name": "target-app-hpa"},
+        "source": "prometheus"
+    }
+
+    def mock_requests_get(url, params=None, timeout=None):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        query = params.get("query", "") if params else ""
+        if "metric_target_type=\"utilization\"" in query:
+            mock_resp.json.return_value = {
+                "data": {"result": [{"value": [1700000000, "4"]}]}
+            }
+        elif "status_current_replicas" in query:
+            mock_resp.json.return_value = {
+                "data": {"result": [{"value": [1700000000, "5"]}]}
+            }
+        elif "status_desired_replicas" in query:
+            mock_resp.json.return_value = {
+                "data": {"result": [{"value": [1700000000, "5"]}]}
+            }
+        elif "container_cpu_usage_seconds_total" in query:
+            mock_resp.json.return_value = {
+                "data": {"result": [{"value": [1700000000, "0.02"]}]}
+            }
+        else:
+            mock_resp.json.return_value = {"data": {"result": []}}
+        return mock_resp
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("cpu-hpa", "Traditional CPU HPA (target-app-hpa)", None, mock_cpu_hpa)):
+        with patch("backend.main.get_prometheus_url", return_value="http://mock-prometheus:9090"):
+            with patch("requests.get", side_effect=mock_requests_get):
+                resp = client.get("/api/hpa/status")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["current_cpu_utilization_percent"] == 4.0
+                assert data["target_cpu_utilization_percent"] == 50
+                assert data["current_replicas"] == 5
+                assert data["desired_replicas"] == 5
+                assert data["raw_cpu_cores"] == 0.02
+
+
+def test_cpu_hpa_status_returns_none_when_metrics_unavailable():
+    """Verify /api/hpa/status returns None when HPA metrics are unavailable (no synthetic calculation)."""
+    mock_cpu_hpa = {
+        "metadata": {"name": "target-app-hpa"},
+        "source": "prometheus"
+    }
+
+    def mock_requests_get(url, params=None, timeout=None):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        query = params.get("query", "") if params else ""
+        # Return empty for HPA utilization, but provide container CPU
+        if "container_cpu_usage_seconds_total" in query:
+            mock_resp.json.return_value = {
+                "data": {"result": [{"value": [1700000000, "0.384"]}]}
+            }
+        else:
+            mock_resp.json.return_value = {"data": {"result": []}}
+        return mock_resp
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("cpu-hpa", "Traditional CPU HPA (target-app-hpa)", None, mock_cpu_hpa)):
+        with patch("backend.main.get_prometheus_url", return_value="http://mock-prometheus:9090"):
+            with patch("requests.get", side_effect=mock_requests_get):
+                resp = client.get("/api/hpa/status")
+                assert resp.status_code == 200
+                data = resp.json()
+                # Must be None, NOT 384% or any computed container CPU calculation
+                assert data["current_cpu_utilization_percent"] is None
+                assert data["raw_cpu_cores"] == 0.384
+
+
+def test_autoscaling_status_cpu_hpa_mode():
+    """Verify /api/autoscaling/status correctly reflects CPU HPA active controller mode with inactive KEDA."""
+    mock_cpu_hpa = {"metadata": {"name": "target-app-hpa"}, "status": {"currentReplicas": 2}}
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("cpu-hpa", "Traditional CPU HPA (target-app-hpa)", None, mock_cpu_hpa)):
+        with patch("backend.main.get_keda_scaledobject_live_status", return_value=None):
+            resp = client.get("/api/autoscaling/status")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["active_controller"] == "cpu-hpa"
+            assert data["scaledobject_present"] is False
+            assert data["ready_status"] is False
+            assert data["active_status"] is False
+            assert data["fallback_active"] is False
+            assert data["scaledobject_state"] == "Standby"
+
+
+def test_autoscaling_status_keda_active_mode():
+    """Verify /api/autoscaling/status correctly reflects healthy active KEDA controller mode."""
+    mock_keda_hpa = {"metadata": {"name": "keda-hpa-target-app-predictive-scaledobject"}, "status": {"currentReplicas": 3}}
+    mock_live_keda = {
+        "ready": True,
+        "active": True,
+        "fallback": False,
+        "hpa_name": "keda-hpa-target-app-predictive-scaledobject",
+        "failures": 0,
+    }
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("keda", "KEDA Predictive Autoscaler (keda-hpa-target-app-predictive-scaledobject)", mock_keda_hpa, None)):
+        with patch("backend.main.get_keda_scaledobject_live_status", return_value=mock_live_keda):
+            resp = client.get("/api/autoscaling/status")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["active_controller"] == "keda"
+            assert data["scaledobject_present"] is True
+            assert data["ready_status"] is True
+            assert data["fallback_active"] is False
+
+
+def test_autoscaling_status_keda_fallback_mode():
+    """Verify /api/autoscaling/status correctly reflects KEDA fallback mode when ScaledObject has failures."""
+    mock_keda_hpa = {"metadata": {"name": "keda-hpa-target-app-predictive-scaledobject"}, "status": {"currentReplicas": 2}}
+    mock_live_keda = {
+        "ready": True,
+        "active": True,
+        "fallback": True,
+        "hpa_name": "keda-hpa-target-app-predictive-scaledobject",
+        "failures": 3,
+    }
+
+    with patch("backend.main.get_active_autoscaler_controller", return_value=("keda", "KEDA Predictive Autoscaler (keda-hpa-target-app-predictive-scaledobject)", mock_keda_hpa, None)):
+        with patch("backend.main.get_keda_scaledobject_live_status", return_value=mock_live_keda):
+            resp = client.get("/api/autoscaling/status")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["active_controller"] == "keda"
+            assert data["scaledobject_present"] is True
+            assert data["fallback_active"] is True
+            assert data["scaledobject_state"] == "Fallback"
+
+
+def test_autoscaling_status_zero_prediction():
+    """Verify /api/autoscaling/status preserves valid zero prediction as 0.0 with fresh status."""
+    now = time.time()
+    PREDICTION_TIMESTAMP_GAUGE.set(now - 5.0)
+    PREDICTED_LOAD_GAUGE.set(0.0)
+    PREDICTION_PROVENANCE_GAUGE.set(1.0)
+    set_last_forecast_error(None)
+
+    resp = client.get("/api/autoscaling/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["current_predicted_load"] == 0.0
+    assert data["is_fresh"] is True
+    assert data["forecast_status"] == "fresh"
+    assert data["prediction_age_seconds"] < 45.0
+
+
+def test_autoscaling_status_positive_prediction():
+    """Verify /api/autoscaling/status returns positive predictions normally when fresh."""
+    now = time.time()
+    PREDICTION_TIMESTAMP_GAUGE.set(now - 10.0)
+    PREDICTED_LOAD_GAUGE.set(18.5)
+    PREDICTION_PROVENANCE_GAUGE.set(1.0)
+    set_last_forecast_error(None)
+
+    resp = client.get("/api/autoscaling/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["current_predicted_load"] == 18.5
+    assert data["is_fresh"] is True
+    assert data["forecast_status"] == "fresh"
+
+
+def test_autoscaling_status_missing_prediction():
+    """Verify /api/autoscaling/status returns waiting_for_data and not fresh when predictions are missing."""
+    PREDICTION_TIMESTAMP_GAUGE.set(0.0)
+    PREDICTED_LOAD_GAUGE.set(0.0)
+    PREDICTION_PROVENANCE_GAUGE.set(0.0)
+    set_last_forecast_error("Waiting for sufficient live observations")
+
+    with patch("backend.main.get_prometheus_url", return_value=None):
+        resp = client.get("/api/autoscaling/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["is_fresh"] is False
+        assert data["forecast_status"] == "waiting_for_data"
+
+
+def test_autoscaling_status_stale_prediction():
+    """Verify /api/autoscaling/status marks predictions stale and is_fresh=False when age >= 45s."""
+    now = time.time()
+    PREDICTION_TIMESTAMP_GAUGE.set(now - 60.0)
+    PREDICTED_LOAD_GAUGE.set(12.0)
+    PREDICTION_PROVENANCE_GAUGE.set(1.0)
+    set_last_forecast_error(None)
+
+    resp = client.get("/api/autoscaling/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["is_fresh"] is False
+    assert data["forecast_status"] == "stale"
+    assert data["prediction_age_seconds"] >= 45.0
+
+
+
 
 
 

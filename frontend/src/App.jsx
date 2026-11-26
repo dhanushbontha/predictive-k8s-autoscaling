@@ -79,12 +79,7 @@ export default function App() {
 
       if (autoRes.status === 'fulfilled') {
         setAutoscalingStatus(autoRes.value);
-        if (autoRes.value?.forecast_status === 'waiting_for_data') {
-          setForecastData(null);
-          if (autoRes.value?.forecast_error) {
-            setForecastError(autoRes.value.forecast_error);
-          }
-        } else if (autoRes.value?.forecast_error && !autoRes.value?.is_fresh) {
+        if (autoRes.value?.forecast_error && !autoRes.value?.is_fresh) {
           setForecastError(autoRes.value.forecast_error);
         }
       }
@@ -223,6 +218,7 @@ export default function App() {
               forecastError={forecastError}
               k8sStatus={k8sStatus}
               autoscalingStatus={autoscalingStatus}
+              cpuHpaStatus={cpuHpaStatus}
               workloadStatus={workloadStatus}
               backendHealthy={backendHealthy}
               prometheusHealthy={prometheusHealthy}
@@ -250,6 +246,8 @@ export default function App() {
               autoscalingStatus={autoscalingStatus}
               metrics={metrics}
               k8sStatus={k8sStatus}
+              forecastData={forecastData}
+              forecastError={forecastError}
             />
           )}
 

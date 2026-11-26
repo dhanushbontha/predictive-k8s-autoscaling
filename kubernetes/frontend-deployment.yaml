@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: predictive-k8s-frontend:1.1
+        image: predictive-k8s-frontend:1.5
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 80

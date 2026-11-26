@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   ShieldCheck,
+  ShieldAlert,
   Gauge,
   Clock,
   Layers,
@@ -8,19 +9,38 @@ import {
   Settings,
   CheckCircle2,
   AlertTriangle,
+  Info,
+  TrendingUp,
 } from 'lucide-react';
 import MetricCard from '../components/MetricCard';
 import StatusBadge from '../components/StatusBadge';
 import { formatToIstTime } from '../utils/timezone';
+import { resolvePredictedRps, prepareForecastChartData } from '../utils/forecast';
+import {
+  ResponsiveContainer,
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from 'recharts';
 
-export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
-  const currentVal =
-    autoscalingStatus?.current_predicted_load !== undefined &&
-    autoscalingStatus?.current_predicted_load !== null
-      ? Number(autoscalingStatus.current_predicted_load).toFixed(2)
-      : metrics?.forecast?.yhat !== undefined
-      ? Number(metrics.forecast.yhat).toFixed(2)
-      : '--';
+export default function Autoscaling({
+  autoscalingStatus,
+  metrics,
+  k8sStatus,
+  forecastData,
+  forecastError,
+}) {
+  const isCpuHpaMode = autoscalingStatus?.active_controller === 'cpu-hpa';
+  const isKedaMode = autoscalingStatus?.active_controller === 'keda';
+  const scaledObjectPresent = autoscalingStatus?.scaledobject_present ?? (isKedaMode || (autoscalingStatus?.scaledobject_state !== 'Standby' && autoscalingStatus?.scaledobject_state !== 'Inactive'));
+
+  const isGateValid = Boolean(autoscalingStatus?.is_fresh);
+  const readyStatus = autoscalingStatus?.ready_status ?? false;
+  const activeStatus = autoscalingStatus?.active_status ?? (isKedaMode && isGateValid);
+  const fallbackActive = autoscalingStatus?.fallback_active ?? false;
 
   const freshnessAge =
     autoscalingStatus?.prediction_age_seconds !== null &&
@@ -28,69 +48,15 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
       ? Math.round(autoscalingStatus.prediction_age_seconds)
       : null;
 
-  const isGateValid = Boolean(autoscalingStatus?.is_fresh);
-  const activeError = autoscalingStatus?.forecast_error;
-  const forecastStatus = autoscalingStatus?.forecast_status || (isGateValid ? 'fresh' : 'waiting_for_data');
+  // Shared forecast resolution ensures exact match with Overview and live backend
+  const predInfo = resolvePredictedRps({
+    autoscalingStatus,
+    forecastData,
+    metrics,
+    backendHealthy: true,
+  });
 
-  let metricValueDisplay = currentVal;
-  let metricUnitDisplay = 'req/s';
-  let metricBadge = null;
-  let metricSubtitle = 'Queried live by KEDA scaler';
-  let metricVariant = 'cyan';
-
-  const isInsufficient = Boolean(
-    activeError && (activeError.toLowerCase().includes('insufficient') || activeError.toLowerCase().includes('at least 5'))
-  );
-  const isWaiting =
-    forecastStatus === 'waiting_for_data' ||
-    isInsufficient ||
-    !isGateValid ||
-    freshnessAge === null ||
-    autoscalingStatus?.last_prediction_timestamp === 0 ||
-    autoscalingStatus?.last_prediction_timestamp === null;
-
-  if (isWaiting || isInsufficient) {
-    metricValueDisplay = '--';
-    metricUnitDisplay = 'req/s';
-    metricBadge = null;
-    metricSubtitle = (
-      <span
-        className="flex items-center gap-1.5 text-amber-400 text-xs font-medium"
-        title={activeError || 'Awaiting 5 traffic samples on /api/work'}
-      >
-        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 animate-pulse" />
-        <span>Waiting for live data</span>
-      </span>
-    );
-    metricVariant = 'amber';
-  } else if (freshnessAge !== null && freshnessAge !== undefined && (freshnessAge >= 45 || forecastStatus === 'stale')) {
-    metricValueDisplay = '--';
-    metricUnitDisplay = 'req/s';
-    metricBadge = null;
-    metricSubtitle = (
-      <span className="flex items-center gap-1.5 text-amber-400 text-xs font-medium">
-        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
-        <span>Stale (&ge;45s gate closed)</span>
-      </span>
-    );
-    metricVariant = 'amber';
-  } else if (isGateValid && currentVal !== '--' && Number(currentVal) > 0) {
-    metricValueDisplay = currentVal;
-    metricUnitDisplay = 'req/s';
-    metricBadge = null;
-    metricSubtitle = `Active query &bull; Refreshed ${freshnessAge}s ago`;
-    metricVariant = 'cyan';
-  } else {
-    metricValueDisplay = '--';
-    metricUnitDisplay = 'req/s';
-    metricBadge = null;
-    metricSubtitle = activeError || 'Waiting for live data';
-    metricVariant = 'amber';
-  }
-
-  const readyStatus = autoscalingStatus?.ready_status ?? true;
-  const activeStatus = autoscalingStatus?.active_status ?? isGateValid;
-  const fallbackActive = autoscalingStatus?.fallback_active ?? false;
+  const { chartData, hasPoints, yDomain } = prepareForecastChartData(forecastData, 30);
 
   const activeQuery =
     autoscalingStatus?.query ||
@@ -115,24 +81,43 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
               <h2 className="text-base font-semibold text-slate-100">
                 KEDA ScaledObject: {autoscalingStatus?.scaledobject_name || 'target-app-predictive-scaledobject'}
               </h2>
-              <StatusBadge
-                status={readyStatus ? 'healthy' : 'error'}
-                label={readyStatus ? 'READY' : 'NOT READY'}
-                size="xs"
-              />
-              <StatusBadge
-                status={activeStatus ? 'active' : 'warning'}
-                label={activeStatus ? 'ACTIVE' : 'INACTIVE'}
-                size="xs"
-              />
-              <StatusBadge
-                status={fallbackActive ? 'fallback' : 'healthy'}
-                label={fallbackActive ? 'FALLBACK ACTIVE' : 'FALLBACK STANDBY'}
-                size="xs"
-              />
-              <span className="text-xs px-2.5 py-0.5 rounded-full font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                Active Controller
-              </span>
+              {isCpuHpaMode || !scaledObjectPresent ? (
+                <>
+                  <StatusBadge
+                    status="idle"
+                    label="KEDA INACTIVE"
+                    size="xs"
+                  />
+                  <span className="text-xs px-2.5 py-0.5 rounded-full font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30">
+                    Standby (CPU HPA Active)
+                  </span>
+                </>
+              ) : (
+                <>
+                  <StatusBadge
+                    status={activeStatus ? 'active' : 'warning'}
+                    label={activeStatus ? 'KEDA ACTIVE' : 'KEDA INACTIVE'}
+                    size="xs"
+                  />
+                  <StatusBadge
+                    status={readyStatus ? 'healthy' : 'error'}
+                    label={readyStatus ? 'READY' : 'NOT READY'}
+                    size="xs"
+                  />
+                  <StatusBadge
+                    status={fallbackActive ? 'fallback' : 'healthy'}
+                    label={fallbackActive ? 'FALLBACK ACTIVE' : 'FALLBACK STANDBY'}
+                    size="xs"
+                  />
+                  <span className={`text-xs px-2.5 py-0.5 rounded-full font-medium border ${
+                    isKedaMode
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                      : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                  }`}>
+                    {isKedaMode ? 'Active Controller' : 'Standby Controller'}
+                  </span>
+                </>
+              )}
             </div>
             <p className="text-xs text-slate-400 mt-1">
               KEDA-Managed HPA: <span className="font-mono text-cyan-400 font-semibold">{autoscalingStatus?.hpa_name || 'keda-hpa-target-app-predictive-scaledobject'}</span> &bull; Target: <span className="font-mono text-slate-300">Deployment/{autoscalingStatus?.target_deployment || 'target-app'}</span> &bull; Metric: <span className="font-mono text-emerald-400">s0-prometheus (predicted_http_work_rps)</span>
@@ -143,23 +128,54 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
         <div className="flex items-center gap-2">
           <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono">
             <span className="text-slate-400">State: </span>
-            <span className="text-cyan-400 font-semibold uppercase">
-              {autoscalingStatus?.scaledobject_state || 'Active'}
+            <span className={`font-semibold uppercase ${isCpuHpaMode ? 'text-amber-400' : 'text-cyan-400'}`}>
+              {isCpuHpaMode ? 'Inactive (Standby)' : (autoscalingStatus?.scaledobject_state || 'Active')}
             </span>
           </div>
         </div>
+      </div>
+
+      {/* Controller Authority Notice Banner */}
+      <div
+        className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 text-xs ${
+          isCpuHpaMode
+            ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+            : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+        }`}
+      >
+        <div className="flex items-center gap-2.5">
+          {isCpuHpaMode ? (
+            <ShieldAlert className="w-4 h-4 text-amber-400 flex-shrink-0" />
+          ) : (
+            <ShieldCheck className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+          )}
+          <span className="font-medium">
+            {isCpuHpaMode
+              ? 'KEDA is inactive — CPU HPA controls target-app.'
+              : 'KEDA ACTIVE — Predictive Autoscaler actively controls Deployment/target-app based on predicted RPS.'}
+          </span>
+        </div>
+        <span className="text-[11px] font-mono text-slate-400 shrink-0">
+          {isCpuHpaMode ? 'Active Controller: Traditional CPU HPA (50% target)' : 'Active Controller: KEDA Predictive Scaler'}
+        </span>
       </div>
 
       {/* KPI Metrics */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard
           title="Predicted RPS Metric"
-          value={metricValueDisplay}
-          unit={metricUnitDisplay}
-          badge={metricBadge}
-          subtitle={metricSubtitle}
+          value={predInfo.displayValue}
+          unit={predInfo.unit}
+          badge={
+            predInfo.badgeLabel ? (
+              <span className="inline-block text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30">
+                {predInfo.badgeLabel}
+              </span>
+            ) : null
+          }
+          subtitle={predInfo.subtitle}
           icon={Gauge}
-          variant={metricVariant}
+          variant={predInfo.variant}
         />
         <MetricCard
           title="Scaling Threshold"
@@ -181,10 +197,114 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
           title="Freshness & Fallback"
           value={freshnessAge !== null ? `${freshnessAge}s` : 'N/A'}
           unit={isGateValid ? '(Valid)' : '(Stale)'}
-          subtitle={fallbackActive ? 'Fallback active: 2 pods' : 'Fallback standby: 3 fails'}
+          subtitle={
+            isCpuHpaMode || !scaledObjectPresent
+              ? 'ScaledObject absent · Fallback not applicable'
+              : fallbackActive
+              ? 'Fallback active: 2 pods'
+              : 'Fallback standby: 3 fails'
+          }
           icon={Clock}
           variant={isGateValid ? 'emerald' : 'amber'}
         />
+      </div>
+
+      {/* Prophet Load Forecast Horizon Chart (Preview on Predictive KEDA page) */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm space-y-3">
+        <div className="flex items-center justify-between mb-1">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 flex-wrap">
+              <TrendingUp className="w-4 h-4 text-cyan-400" />
+              <span>Prophet Load Forecast Horizon (Next 30 Steps)</span>
+              {isCpuHpaMode && (
+                <span className="text-[10px] font-normal px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30">
+                  Informational only — not used for scaling
+                </span>
+              )}
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {isCpuHpaMode
+                ? "Informational only — not used for scaling in CPU HPA mode. Monitored for comparison with CPU baseline."
+                : "Active workload prediction horizon used by KEDA Prometheus scaler for predictive scaling decisions."}
+            </p>
+          </div>
+        </div>
+
+        <div className="h-64 w-full">
+          {hasPoints ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="kedaYhatGlow" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="#06b6d4" stopOpacity={0.0} />
+                  </linearGradient>
+                  <linearGradient id="kedaBoundsGlow" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#6366f1" stopOpacity={0.15} />
+                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                <XAxis
+                  dataKey="time"
+                  stroke="#64748b"
+                  fontSize={11}
+                  tickLine={false}
+                />
+                <YAxis
+                  stroke="#64748b"
+                  fontSize={11}
+                  tickLine={false}
+                  domain={yDomain}
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: '#0f172a',
+                    borderColor: '#334155',
+                    borderRadius: '8px',
+                    fontSize: '12px',
+                  }}
+                  labelStyle={{ color: '#94a3b8' }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="yhat_upper"
+                  stroke="#6366f1"
+                  strokeDasharray="2 2"
+                  fill="none"
+                  name="Upper Bound"
+                />
+                <Area
+                  type="monotone"
+                  dataKey="yhat"
+                  stroke="#06b6d4"
+                  strokeWidth={2.5}
+                  fillOpacity={1}
+                  fill="url(#kedaYhatGlow)"
+                  name="Predicted RPS"
+                />
+                <Area
+                  type="monotone"
+                  dataKey="yhat_lower"
+                  stroke="#6366f1"
+                  strokeDasharray="2 2"
+                  fill="url(#kedaBoundsGlow)"
+                  name="Lower Bound"
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-full flex flex-col items-center justify-center p-6 text-center text-xs text-slate-400 bg-slate-950/40 rounded-lg border border-dashed border-slate-800">
+              <Info className="w-8 h-8 text-amber-400/90 mb-2" />
+              <span className="font-semibold text-slate-200 mb-1">
+                Waiting for sufficient live Prometheus observations to fit Prophet.
+              </span>
+              <span className="max-w-md text-slate-400 leading-relaxed">
+                At least 5 live observations on /api/work are required to fit the time-series model.
+              </span>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Live KEDA HPA Conditions & External Metrics Info */}
@@ -200,7 +320,14 @@ export default function Autoscaling({ autoscalingStatus, metrics, k8sStatus }) {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          {(autoscalingStatus?.conditions && autoscalingStatus.conditions.length > 0) ? (
+          {(isCpuHpaMode || !scaledObjectPresent) ? (
+            <div className="col-span-3 text-xs text-slate-400 py-3 px-4 bg-slate-950/60 rounded-lg border border-slate-800 flex items-center gap-2.5">
+              <Info className="w-4 h-4 text-amber-400/80 shrink-0" />
+              <span>
+                KEDA-specific HPA conditions are unavailable: KEDA ScaledObject is absent and CPU HPA is the active controller.
+              </span>
+            </div>
+          ) : (autoscalingStatus?.conditions && autoscalingStatus.conditions.length > 0) ? (
             autoscalingStatus.conditions.map((cond, idx) => (
               <div
                 key={idx}

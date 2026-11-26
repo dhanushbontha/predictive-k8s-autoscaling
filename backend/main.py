@@ -1100,6 +1100,7 @@ class CpuHpaStatusResponse(BaseModel):
     desired_replicas: int = 1
     min_replicas: int = 1
     max_replicas: int = 5
+    raw_cpu_cores: Optional[float] = None
     conditions: List[HpaCondition] = Field(default_factory=list)
     scaling_events: List[HpaScalingEvent] = Field(default_factory=list)
     last_fitting_timestamp: Optional[float] = None
@@ -1138,6 +1139,7 @@ class AutoscalingStatusResponse(BaseModel):
     last_scale_event: Optional[str] = None
     active_controller: str = "keda"
     active_controller_name: str = "KEDA Predictive Autoscaler (target-app-predictive-scaledobject)"
+    scaledobject_present: bool = False
     conditions: List[HpaCondition] = Field(default_factory=list)
     scaling_events: List[HpaScalingEvent] = Field(default_factory=list)
     last_fitting_timestamp: Optional[float] = None
@@ -1353,10 +1355,13 @@ def get_kubernetes_scaling_events(object_filter: str = "") -> List[HpaScalingEve
 def get_active_autoscaler_controller() -> Tuple[str, str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Determines which autoscaler controller currently governs Deployment/target-app.
+    Queries live Kubernetes HPA state via kubectl or Prometheus kube-state-metrics.
     Returns: (controller_key, controller_name, keda_hpa_json, cpu_hpa_json)
     """
     keda_hpa = None
     cpu_hpa = None
+
+    # 1. Attempt live query via kubectl (when run with cluster credentials or in tests)
     try:
         res = subprocess.run(
             ["kubectl", "get", "hpa", "-n", "default", "-o", "json"],
@@ -1378,13 +1383,36 @@ def get_active_autoscaler_controller() -> Tuple[str, str, Optional[Dict[str, Any
     except Exception:
         pass
 
+    # 2. If not detected via kubectl (e.g. running inside container without kubectl binary or RBAC),
+    # query Prometheus kube-state-metrics for real-time HPA presence
+    if keda_hpa is None and cpu_hpa is None:
+        prom_url = get_prometheus_url()
+        if prom_url:
+            try:
+                r = requests.get(
+                    f"{prom_url}/api/v1/query",
+                    params={"query": 'kube_horizontalpodautoscaler_info{scaletargetref_name="target-app"}'},
+                    timeout=3.0,
+                )
+                if r.status_code == 200:
+                    results = r.json().get("data", {}).get("result", [])
+                    for res_item in results:
+                        metric = res_item.get("metric", {})
+                        hpa_name = metric.get("horizontalpodautoscaler", "")
+                        if "keda" in hpa_name.lower():
+                            keda_hpa = {"metadata": {"name": hpa_name}, "spec": {"scaleTargetRef": {"name": "target-app"}}, "source": "prometheus"}
+                        elif "target-app-hpa" in hpa_name.lower():
+                            cpu_hpa = {"metadata": {"name": hpa_name}, "spec": {"scaleTargetRef": {"name": "target-app"}}, "source": "prometheus"}
+            except Exception as e:
+                logger.warning(f"Failed to query Prometheus for HPA info: {e}")
+
     if keda_hpa and cpu_hpa:
         return "conflict", "Dual Controller Conflict (both KEDA and CPU HPA targeting target-app)", keda_hpa, cpu_hpa
     elif keda_hpa:
         return "keda", "KEDA Predictive Autoscaler (keda-hpa-target-app-predictive-scaledobject)", keda_hpa, cpu_hpa
     elif cpu_hpa:
         return "cpu-hpa", "Traditional CPU HPA (target-app-hpa)", keda_hpa, cpu_hpa
-    return "keda", "KEDA Predictive Autoscaler (Configured Controller)", keda_hpa, cpu_hpa
+    return "none", "No Active Autoscaler (Neither KEDA nor CPU HPA detected in cluster)", None, None
 
 
 # ---------------------------------------------------------------------------
@@ -1553,7 +1581,7 @@ def get_autoscaling_status():
         or "at least 5" in current_error.lower()
     )
 
-    # If backend gauges are at 0 and NO forecast error has occurred, try reading from Prometheus
+    # If backend gauges are at 0 and NO forecast error has occurred, try reading from Prometheus or forecast_cache
     prom_url = get_prometheus_url()
     if last_ts == 0.0 and not current_error and prom_url:
         try:
@@ -1570,6 +1598,11 @@ def get_autoscaling_status():
                     current_prov = "live_prometheus"
         except Exception:
             pass
+
+    if last_ts == 0.0 and forecast_cache.timestamp > 0 and forecast_cache.df is not None and not forecast_cache.df.empty:
+        last_ts = forecast_cache.timestamp
+        current_load = max(0.0, round(float(forecast_cache.df.iloc[-1]["yhat"]), 4))
+        current_prov = forecast_cache.provenance
 
     now = time.time()
     age = max(0.0, round(now - last_ts, 1)) if last_ts > 0 else 9999.0
@@ -1594,6 +1627,9 @@ def get_autoscaling_status():
         fcst_status = "fresh"
         is_fresh = True
 
+    ctrl_key, ctrl_name, keda_hpa, cpu_hpa = get_active_autoscaler_controller()
+    scaledobject_present = (live_keda is not None or keda_hpa is not None)
+
     # Determine KEDA status conditions
     if live_keda:
         ready_status = live_keda["ready"]
@@ -1604,24 +1640,27 @@ def get_autoscaling_status():
             state = "Fallback"
         elif active_status and is_fresh:
             state = "Active"
+        elif not ready_status:
+            state = "Not Ready"
         else:
             state = "Inactive"
-    else:
+    elif keda_hpa is not None:
         ready_status = True
-        if not is_fresh or fcst_status == "waiting_for_data":
-            state = "Fallback" if (last_ts > 0 and age >= 45.0) else "Inactive"
-            active_status = False
-            fallback_active = (last_ts > 0 and age >= 45.0)
-        else:
-            state = "Active"
-            active_status = True
-            fallback_active = False
+        active_status = is_fresh
+        fallback_active = False
+        state = "Active" if is_fresh else "Inactive"
+        hpa_name = manifest_cfg.get("hpa_name", "keda-hpa-target-app-predictive-scaledobject")
+    else:
+        # No KEDA ScaledObject or KEDA HPA exists in Kubernetes
+        ready_status = False
+        active_status = False
+        fallback_active = False
+        state = "Standby" if ctrl_key == "cpu-hpa" else "Inactive"
         hpa_name = manifest_cfg.get("hpa_name", "keda-hpa-target-app-predictive-scaledobject")
 
     threshold = manifest_cfg.get("threshold", 10.0)
     calculated_desired = max(1, min(manifest_cfg.get("max_replicas", 5), math.ceil(current_load / threshold)))
 
-    ctrl_key, ctrl_name, keda_hpa, cpu_hpa = get_active_autoscaler_controller()
     keda_conditions = []
     if keda_hpa:
         for c in keda_hpa.get("status", {}).get("conditions", []):
@@ -1672,6 +1711,7 @@ def get_autoscaling_status():
         last_scale_event=f"Evaluated {current_load:.1f} RPS -> desired: {calculated_desired} replica(s)",
         active_controller=ctrl_key,
         active_controller_name=ctrl_name,
+        scaledobject_present=scaledobject_present,
         conditions=keda_conditions,
         scaling_events=keda_events,
         last_fitting_timestamp=round(last_fit_ts, 2) if last_fit_ts else None,
@@ -1686,6 +1726,9 @@ def get_cpu_hpa_status():
     """
     Returns real-time status of the traditional Kubernetes CPU-Based HPA.
     Distinguishes whether it is currently active or in standby relative to KEDA.
+    Reads actual HPA currentMetrics resource CPU averageUtilization, desired replicas,
+    current replicas, and HPA conditions directly from the Kubernetes HPA.
+    Does not independently calculate a supposedly equivalent value from summed container CPU usage.
     """
     config = get_cpu_hpa_manifest_config()
     ctrl_key, ctrl_name, keda_hpa, cpu_hpa = get_active_autoscaler_controller()
@@ -1695,13 +1738,17 @@ def get_cpu_hpa_status():
 
     curr_reps = 1
     desired_reps = 1
-    cpu_util_pct = None
-    conditions = []
+    cpu_util_pct: Optional[float] = None
+    raw_cpu_cores: Optional[float] = None
+    conditions: List[HpaCondition] = []
 
-    if cpu_hpa:
+    has_kubectl_status = False
+    # 1. Parse live status from kubectl output if available
+    if cpu_hpa and "status" in cpu_hpa and isinstance(cpu_hpa.get("status"), dict) and cpu_hpa["status"]:
         status = cpu_hpa.get("status", {})
         curr_reps = status.get("currentReplicas", 1)
         desired_reps = status.get("desiredReplicas", curr_reps)
+        has_kubectl_status = True
         raw_conds = status.get("conditions", [])
         for c in raw_conds:
             conditions.append(
@@ -1716,50 +1763,113 @@ def get_cpu_hpa_status():
         for m in status.get("currentMetrics", []):
             if m.get("type") == "Resource" and m.get("resource", {}).get("name") == "cpu":
                 cur_res = m.get("resource", {}).get("current", {})
-                if "averageUtilization" in cur_res:
+                if "averageUtilization" in cur_res and cur_res["averageUtilization"] is not None:
                     cpu_util_pct = float(cur_res["averageUtilization"])
-    else:
-        # If target-app-hpa is not applied in cluster, query live Prometheus for target-app CPU usage
-        prom_url = get_prometheus_url()
-        if prom_url:
-            try:
-                r_cpu = requests.get(
-                    f"{prom_url}/api/v1/query",
-                    params={"query": 'sum(node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate{namespace="default", pod=~"target-app-.*"})'},
-                    timeout=2.0
-                )
-                if r_cpu.status_code == 200:
-                    res_cpu = r_cpu.json().get("data", {}).get("result", [])
-                    if res_cpu and "value" in res_cpu[0]:
-                        cpu_cores = float(res_cpu[0]["value"][1])
-                        # Query pod count
-                        r_pods = requests.get(
+
+    # 2. Query in-cluster Prometheus telemetry for HPA currentMetrics, replicas, and conditions
+    prom_url = get_prometheus_url()
+    if prom_url:
+        try:
+            if is_applied:
+                # Obtain the actual HPA currentMetrics resource CPU averageUtilization from Prometheus telemetry
+                if cpu_util_pct is None:
+                    r_hpa_util = requests.get(
+                        f"{prom_url}/api/v1/query",
+                        params={"query": 'kube_horizontalpodautoscaler_status_target_metric{namespace="default", horizontalpodautoscaler="target-app-hpa", metric_name="cpu", metric_target_type="utilization"}'},
+                        timeout=2.0
+                    )
+                    if r_hpa_util.status_code == 200:
+                        res_util = r_hpa_util.json().get("data", {}).get("result", [])
+                        if res_util and "value" in res_util[0]:
+                            cpu_util_pct = float(res_util[0]["value"][1])
+
+                if not has_kubectl_status:
+                    # Query Prometheus for live HPA current replicas from the same HPA and namespace
+                    r_cr = requests.get(
+                        f"{prom_url}/api/v1/query",
+                        params={"query": 'max(kube_horizontalpodautoscaler_status_current_replicas{namespace="default", horizontalpodautoscaler="target-app-hpa"})'},
+                        timeout=2.0
+                    )
+                    if r_cr.status_code == 200:
+                        res_cr = r_cr.json().get("data", {}).get("result", [])
+                        if res_cr and "value" in res_cr[0]:
+                            curr_reps = max(1, int(float(res_cr[0]["value"][1])))
+
+                    # Query Prometheus for live HPA desired replicas from the same HPA and namespace
+                    r_dr = requests.get(
+                        f"{prom_url}/api/v1/query",
+                        params={"query": 'max(kube_horizontalpodautoscaler_status_desired_replicas{namespace="default", horizontalpodautoscaler="target-app-hpa"})'},
+                        timeout=2.0
+                    )
+                    if r_dr.status_code == 200:
+                        res_dr = r_dr.json().get("data", {}).get("result", [])
+                        if res_dr and "value" in res_dr[0]:
+                            desired_reps = max(1, int(float(res_dr[0]["value"][1])))
+
+                    # Query live HPA conditions from Prometheus if not populated
+                    if not conditions:
+                        r_cond = requests.get(
                             f"{prom_url}/api/v1/query",
-                            params={"query": 'count(kube_pod_status_phase{namespace="default", pod=~"target-app-.*", phase="Running"})'},
+                            params={"query": 'kube_horizontalpodautoscaler_status_condition{namespace="default", horizontalpodautoscaler="target-app-hpa", status="true"}'},
                             timeout=2.0
                         )
-                        if r_pods.status_code == 200:
-                            p_res = r_pods.json().get("data", {}).get("result", [])
-                            if p_res and "value" in p_res[0]:
-                                curr_reps = max(1, int(float(p_res[0]["value"][1])))
-                        # Calculate CPU% relative to 100m (0.1 core) request per pod
-                        requested_cores = curr_reps * 0.1
-                        cpu_util_pct = round((cpu_cores / max(0.01, requested_cores)) * 100.0, 1)
-            except Exception:
-                pass
+                        if r_cond.status_code == 200:
+                            active_conds = {
+                                item.get("metric", {}).get("condition"): (float(item.get("value", [0, 0])[1]) == 1.0)
+                                for item in r_cond.json().get("data", {}).get("result", [])
+                            }
+                            is_able = active_conds.get("AbleToScale", True)
+                            is_scaling = active_conds.get("ScalingActive", True)
+                            is_limited = active_conds.get("ScalingLimited", False)
+                            conditions = [
+                                HpaCondition(
+                                    type="AbleToScale",
+                                    status="True" if is_able else "False",
+                                    reason="ReadyForNewScale" if is_able else "ScalingDisabled",
+                                    message="recommended size matches current size" if is_able else "the HPA controller was unable to scale",
+                                ),
+                                HpaCondition(
+                                    type="ScalingActive",
+                                    status="True" if is_scaling else "False",
+                                    reason="ValidMetricFound" if is_scaling else "FailedGetResourceMetric",
+                                    message="the HPA was able to successfully calculate a replica count from cpu resource" if is_scaling else "the HPA was unable to compute the replica count",
+                                ),
+                                HpaCondition(
+                                    type="ScalingLimited",
+                                    status="True" if is_limited else "False",
+                                    reason="TooManyReplicas" if is_limited else "DesiredWithinRange",
+                                    message="the desired count is within the acceptable range" if not is_limited else "the desired replica count is capped",
+                                ),
+                            ]
 
+            # Keep raw Prometheus container CPU usage available separately for diagnostics
+            r_raw = requests.get(
+                f"{prom_url}/api/v1/query",
+                params={"query": 'sum(rate(container_cpu_usage_seconds_total{namespace="default", pod=~"target-app.*"}[1m]))'},
+                timeout=2.0
+            )
+            if r_raw.status_code == 200:
+                res_raw = r_raw.json().get("data", {}).get("result", [])
+                if res_raw and "value" in res_raw[0]:
+                    raw_cpu_cores = round(float(res_raw[0]["value"][1]), 4)
+
+        except Exception as e:
+            logger.warning(f"Error querying Prometheus for CPU HPA metrics: {e}")
+
+    # Fallback conditions if not already constructed
+    if not conditions:
         conditions = [
             HpaCondition(
                 type="AbleToScale",
                 status="True" if is_applied else "False",
-                reason="ControllerStandby" if not is_applied else "ReadyForNewScale",
-                message="Target-app is currently controlled by KEDA Predictive Autoscaler. CPU HPA is configured in manifest as baseline comparison." if not is_applied else "HPA is active and ready to scale",
+                reason="ReadyForNewScale" if is_applied else "ControllerStandby",
+                message="HPA is active and ready to scale" if is_applied else "target-app-hpa is not applied in cluster.",
             ),
             HpaCondition(
                 type="ScalingActive",
                 status="True" if is_applied else "False",
                 reason="ValidMetricFound" if is_applied else "ControllerStandby",
-                message="CPU utilization metric monitoring active" if is_applied else "Standby: not scaling target deployment while KEDA is active",
+                message="CPU utilization metric monitoring active" if is_applied else "Standby: target-app-hpa not active in cluster",
             ),
             HpaCondition(
                 type="ScalingLimited",
@@ -1784,6 +1894,7 @@ def get_cpu_hpa_status():
         desired_replicas=desired_reps,
         min_replicas=config.min_replicas,
         max_replicas=config.max_replicas,
+        raw_cpu_cores=raw_cpu_cores,
         conditions=conditions,
         scaling_events=scaling_events,
         config=config,

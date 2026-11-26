@@ -14,6 +14,7 @@ import {
 import MetricCard from '../components/MetricCard';
 import StatusBadge from '../components/StatusBadge';
 import { formatToIstTime, formatToIstChartTime } from '../utils/timezone';
+import { resolvePredictedRps, prepareForecastChartData } from '../utils/forecast';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -30,11 +31,25 @@ export default function Overview({
   forecastError,
   k8sStatus,
   autoscalingStatus,
+  cpuHpaStatus,
   workloadStatus,
   backendHealthy = true,
   prometheusHealthy = false,
   onNavigate,
 }) {
+  const isCpuHpaMode = autoscalingStatus?.active_controller === 'cpu-hpa';
+
+  // Shared forecast resolution utility: guarantees consistency across pages
+  const predInfo = resolvePredictedRps({
+    autoscalingStatus,
+    forecastData,
+    metrics,
+    backendHealthy,
+  });
+
+  const { chartData: miniChartData, hasPoints, yDomain: chartYDomain } =
+    prepareForecastChartData(forecastData, 30);
+
   // Extract observed metrics from backend /api/metrics or fallback
   const observed = metrics?.observed || metrics?.current_metrics || {};
 
@@ -144,6 +159,12 @@ export default function Overview({
   const maxReplicas = k8sStatus?.max_replicas ?? autoscalingStatus?.max_replicas ?? 5;
 
   // CPU and Memory utilization
+  const cpuHpaPercent =
+    cpuHpaStatus?.current_cpu_utilization_percent !== null &&
+    cpuHpaStatus?.current_cpu_utilization_percent !== undefined
+      ? Math.round(Number(cpuHpaStatus.current_cpu_utilization_percent))
+      : null;
+
   const cpuCores = k8sStatus?.cpu_usage_cores ?? 0.0;
   const cpuMillicores = (cpuCores * 1000).toFixed(1);
   const cpuPercent =
@@ -172,22 +193,6 @@ export default function Overview({
   const lastPredictionTimeStr = autoscalingStatus?.last_prediction_timestamp && autoscalingStatus.last_prediction_timestamp > 0
     ? formatToIstTime(autoscalingStatus.last_prediction_timestamp)
     : '--';
-
-  // Format forecast points for the mini-chart (only show if forecast is fresh and active)
-  const points = (isFresh && forecastData) ? (forecastData?.data || forecastData?.forecast || []) : [];
-  const miniChartData = points.slice(0, 30).map((pt, idx) => {
-    let timeLabel = `+${idx * 15}s`;
-    const tsStr = pt.ds || pt.timestamp;
-    if (tsStr) {
-      timeLabel = formatToIstChartTime(tsStr);
-    }
-    return {
-      time: timeLabel,
-      yhat: Number(pt.yhat || 0).toFixed(1),
-      yhat_lower: Number(Math.max(0, pt.yhat_lower || 0)).toFixed(1),
-      yhat_upper: Number(pt.yhat_upper || 0).toFixed(1),
-    };
-  });
 
   return (
     <div className="space-y-6">
@@ -235,12 +240,18 @@ export default function Overview({
         />
         <MetricCard
           title="Predicted RPS"
-          value={predictedValue}
-          unit={predictedUnit}
-          badge={predictedBadge}
-          subtitle={predictedSubtitle}
+          value={predInfo.displayValue}
+          unit={predInfo.unit}
+          badge={
+            predInfo.badgeLabel ? (
+              <span className="inline-block text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30">
+                {predInfo.badgeLabel}
+              </span>
+            ) : null
+          }
+          subtitle={predInfo.subtitle}
           icon={TrendingUp}
-          variant={predictedVariant}
+          variant={predInfo.variant}
         />
         <MetricCard
           title="Current Replicas"
@@ -260,16 +271,32 @@ export default function Overview({
         />
         <MetricCard
           title="Active Autoscaler"
-          value={autoscalingStatus?.active_controller === 'cpu-hpa' ? 'CPU HPA' : 'Predictive KEDA'}
-          subtitle={autoscalingStatus?.active_controller === 'cpu-hpa' ? 'Reactive CPU target (50%)' : 'Proactive request scaler'}
+          value={isCpuHpaMode ? 'CPU HPA' : 'Predictive KEDA'}
+          subtitle={
+            isCpuHpaMode
+              ? 'Reactive CPU target (50%)'
+              : 'Proactive request scaler'
+          }
           icon={ShieldCheck}
           variant="purple"
         />
         <MetricCard
-          title="Cluster Resources"
-          value={`${cpuMillicores}m`}
-          unit={`/ ${memFormatted} MiB`}
-          subtitle={`${cpuPercent}% CPU · ${memPercent}% RAM`}
+          title={isCpuHpaMode ? "CPU Utilization" : "Cluster Resources"}
+          value={
+            isCpuHpaMode && cpuHpaPercent !== null
+              ? `${cpuHpaPercent}%`
+              : `${cpuMillicores}m`
+          }
+          unit={
+            isCpuHpaMode && cpuHpaPercent !== null
+              ? `/ 50% target`
+              : `/ ${memFormatted} MiB`
+          }
+          subtitle={
+            isCpuHpaMode
+              ? `Actual CPU: ${cpuHpaPercent !== null ? `${cpuHpaPercent}%` : `${cpuPercent}%`} (Target: 50%) · ${memFormatted} MiB RAM`
+              : `${cpuPercent}% CPU · ${memPercent}% RAM`
+          }
           icon={Cpu}
           variant="cyan"
         />
@@ -281,12 +308,19 @@ export default function Overview({
         <div className="lg:col-span-2 bg-slate-900/60 border border-slate-800 rounded-xl p-5 backdrop-blur-sm">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 flex-wrap">
                 <TrendingUp className="w-4 h-4 text-cyan-400" />
-                Prophet Load Forecast Horizon (Next 30 Steps)
+                <span>Prophet Load Forecast Horizon (Next 30 Steps)</span>
+                {isCpuHpaMode && (
+                  <span className="text-[10px] font-normal px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30">
+                    Informational only — not used for scaling
+                  </span>
+                )}
               </h3>
-              <p className="text-xs text-slate-400">
-                Forward-looking request projections with uncertainty envelope [yhat_lower, yhat_upper]
+              <p className="text-xs text-slate-400 mt-0.5">
+                {isCpuHpaMode
+                  ? "Informational only — not used for scaling in CPU HPA mode. Monitored for baseline comparison."
+                  : "Forward-looking request projections with uncertainty envelope [yhat_lower, yhat_upper] used for predictive scaling."}
               </p>
             </div>
             <button
@@ -298,7 +332,7 @@ export default function Overview({
           </div>
 
           <div className="h-64 w-full">
-            {miniChartData.length > 0 ? (
+            {hasPoints ? (
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={miniChartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                   <defs>
@@ -322,7 +356,7 @@ export default function Overview({
                     stroke="#64748b"
                     fontSize={11}
                     tickLine={false}
-                    domain={[0, 'auto']}
+                    domain={chartYDomain}
                   />
                   <Tooltip
                     contentStyle={{

@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: forecasting-backend
-          image: predictive-forecasting-backend:2.0
+          image: predictive-forecasting-backend:2.4
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

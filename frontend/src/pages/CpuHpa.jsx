@@ -25,7 +25,9 @@ export default function CpuHpa({ cpuHpaStatus, k8sStatus }) {
   const currentCpu =
     cpuHpaStatus?.current_cpu_utilization_percent !== null &&
     cpuHpaStatus?.current_cpu_utilization_percent !== undefined
-      ? Number(cpuHpaStatus.current_cpu_utilization_percent).toFixed(1)
+      ? (Number(cpuHpaStatus.current_cpu_utilization_percent) % 1 === 0
+          ? Number(cpuHpaStatus.current_cpu_utilization_percent).toFixed(0)
+          : Number(cpuHpaStatus.current_cpu_utilization_percent).toFixed(1))
       : null;
 
   const targetCpu = cpuHpaStatus?.target_cpu_utilization_percent ?? 50;
@@ -40,6 +42,10 @@ export default function CpuHpa({ cpuHpaStatus, k8sStatus }) {
     currentReplicas;
   const minReplicas = cpuHpaStatus?.min_replicas ?? 1;
   const maxReplicas = cpuHpaStatus?.max_replicas ?? 5;
+  const rawCpuMillis =
+    cpuHpaStatus?.raw_cpu_cores !== undefined && cpuHpaStatus?.raw_cpu_cores !== null
+      ? (cpuHpaStatus.raw_cpu_cores * 1000).toFixed(0)
+      : null;
 
   const conditions = cpuHpaStatus?.conditions || [];
   const events = cpuHpaStatus?.scaling_events || [];
@@ -60,8 +66,8 @@ export default function CpuHpa({ cpuHpaStatus, k8sStatus }) {
               </h2>
               {/* Cluster Deployment Status */}
               <StatusBadge
-                status={isApplied ? 'ready' : 'idle'}
-                label={isApplied ? 'APPLIED IN CLUSTER' : 'STANDBY BASELINE'}
+                status={isApplied ? (isActiveController ? 'active' : 'ready') : 'idle'}
+                label={isApplied ? (isActiveController ? 'CPU HPA ACTIVE' : 'APPLIED IN CLUSTER') : 'STANDBY BASELINE'}
                 size="xs"
               />
               {/* Active Authority Badge */}
@@ -125,9 +131,13 @@ export default function CpuHpa({ cpuHpaStatus, k8sStatus }) {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard
           title="Current CPU Utilization"
-          value={currentCpu !== null ? currentCpu : '--'}
-          unit="%"
-          subtitle={`Target threshold: ${targetCpu}%`}
+          value={currentCpu !== null ? currentCpu : 'Unavailable'}
+          unit={currentCpu !== null ? '%' : ''}
+          subtitle={
+            currentCpu !== null
+              ? `Target: ${targetCpu}%${rawCpuMillis ? ` · Raw: ${rawCpuMillis}m` : ''}`
+              : 'Unavailable'
+          }
           icon={Cpu}
           variant={currentCpu !== null && Number(currentCpu) > targetCpu ? 'rose' : 'cyan'}
         />

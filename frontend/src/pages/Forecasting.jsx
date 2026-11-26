@@ -90,7 +90,7 @@ export default function Forecasting({
       </span>
     );
     predictedVariant = 'amber';
-  } else if (isFresh && autoscalingStatus?.current_predicted_load !== undefined && autoscalingStatus?.current_predicted_load !== null && autoscalingStatus.current_predicted_load > 0) {
+  } else if (isFresh && autoscalingStatus?.current_predicted_load !== undefined && autoscalingStatus?.current_predicted_load !== null && autoscalingStatus.current_predicted_load >= 0) {
     predictedDisplay = Number(autoscalingStatus.current_predicted_load).toFixed(2);
     predictedUnit = 'req/s';
     predictedBadge = null;
@@ -356,7 +356,7 @@ export default function Forecasting({
                   stroke="#64748b"
                   fontSize={11}
                   tickLine={false}
-                  domain={[0, 'auto']}
+                  domain={[0, (dataMax) => (dataMax && dataMax > 0 ? Math.ceil(dataMax * 1.15) : 5)]}
                   label={{ value: 'RPS (req/s)', angle: -90, position: 'insideLeft', fill: '#64748b', fontSize: 11 }}
                 />
                 <Tooltip
